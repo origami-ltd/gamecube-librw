@@ -170,26 +170,28 @@ if(LIBRW_PLATFORM_GL3)
                 SDL2::SDL2
         )
     endif()
-
-    set(OpenGL_GL_PREFERENCE GLVND)
-    find_package(OpenGL)
-    if(TARGET OpenGL::OpenGL)
-        target_link_libraries(librw
-            PRIVATE
-                OpenGL::OpenGL
-        )
-    elseif(TARGET OpenGL::EGL)
-        target_link_libraries(librw
-            PRIVATE
-                OpenGL::EGL
-        )
-    elseif(TARGET OpenGL::GL)
-        target_link_libraries(librw
-            PRIVATE
-                OpenGL::GL
-        )
-    else()
-        message(FATAL_ERROR "find_package(OpenGL) failed.")
+    
+    if(NOT ANDROID)
+        set(OpenGL_GL_PREFERENCE GLVND)
+        find_package(OpenGL)
+        if(TARGET OpenGL::OpenGL)
+            target_link_libraries(librw
+                PRIVATE
+                    OpenGL::OpenGL
+            )
+        elseif(TARGET OpenGL::EGL)
+            target_link_libraries(librw
+                PRIVATE
+                    OpenGL::EGL
+            )
+        elseif(TARGET OpenGL::GL)
+            target_link_libraries(librw
+                PRIVATE
+                    OpenGL::GL
+            )
+        else()
+            message(FATAL_ERROR "find_package(OpenGL) failed.")
+        endif()
     endif()
 elseif(LIBRW_PLATFORM_D3D9)
     target_link_libraries(librw

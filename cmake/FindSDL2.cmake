@@ -15,11 +15,13 @@ if(NOT SDL2_FOUND)
 
     find_library(SDL2main_LIBRARY SDL2main)
 
-    include(FindPackageHandleStandardArgs)
-    find_package_handle_standard_args(libuv
-        REQUIRED_VARS SDL2_INCLUDE_DIR SDL2_LIBRARY
-    )
-
+    if (NOT ANDROID)
+        include(FindPackageHandleStandardArgs)
+        find_package_handle_standard_args(libuv
+            REQUIRED_VARS SDL2_INCLUDE_DIR SDL2_LIBRARY
+        )
+    endif()
+    
     if(NOT TARGET SDL2::SDL2)
         add_library(SDL2::SDL2 UNKNOWN IMPORTED)
         set_target_properties(SDL2::SDL2 PROPERTIES
