@@ -17,6 +17,7 @@
 #include "d3d/rwd3d9.h"
 #include "gl/rwgl3.h"
 #include "gl/rwwdgl.h"
+#include "gx/rwgx.h"
 
 #define PLUGIN_ID 0
 
@@ -236,6 +237,7 @@ Engine::init(MemoryFunctions *memfuncs)
 	d3d9::registerPlatformPlugins();
 	wdgl::registerPlatformPlugins();
 	gl3::registerPlatformPlugins();
+	gx::registerPlatformPlugins();
 
 	Engine::state = Initialized;
 	return 1;
@@ -270,6 +272,8 @@ Engine::open(EngineOpenParams *p)
 	engine->device = gl3::renderdevice;
 #elif RW_D3D9
 	engine->device = d3d::renderdevice;
+#elif RW_GAMECUBE
+	engine->device = gx::renderdevice;
 #else
 	engine->device = null::renderdevice;
 #endif
@@ -283,6 +287,18 @@ Engine::open(EngineOpenParams *p)
 
 		engine->driver[i]->defaultPipeline = engine->dummyDefaultPipeline;
 
+#ifdef RW_GAMECUBE
+		engine->driver[i]->defaultPipeline = gx::makeDefaultPipeline();
+		engine->driver[i]->rasterCreate = gx::rasterCreate;
+		engine->driver[i]->rasterLock = gx::rasterLock;
+		engine->driver[i]->rasterUnlock = gx::rasterUnlock;
+		engine->driver[i]->rasterLockPalette = gx::rasterLockPalette;
+		engine->driver[i]->rasterUnlockPalette = gx::rasterUnlockPalette;
+		engine->driver[i]->rasterNumLevels = gx::rasterNumLevels;
+		engine->driver[i]->imageFindRasterFormat = gx::imageFindRasterFormat;
+		engine->driver[i]->rasterFromImage = gx::rasterFromImage;
+		engine->driver[i]->rasterToImage = gx::rasterToImage;
+#else
 		engine->driver[i]->rasterCreate = null::rasterCreate;
 		engine->driver[i]->rasterLock = null::rasterLock;
 		engine->driver[i]->rasterUnlock = null::rasterUnlock;
@@ -292,6 +308,7 @@ Engine::open(EngineOpenParams *p)
 		engine->driver[i]->imageFindRasterFormat = null::imageFindRasterFormat;
 		engine->driver[i]->rasterFromImage = null::rasterFromImage;
 		engine->driver[i]->rasterToImage = null::rasterToImage;
+#endif
 	}
 
 	Engine::state = Opened;

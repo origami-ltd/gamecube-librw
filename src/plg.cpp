@@ -75,26 +75,36 @@ PluginList::copy(void *dst, void *src)
 bool
 PluginList::streamRead(Stream *stream, void *object)
 {
-	int32 length;
+	uint32 length;
 	ChunkHeaderInfo header;
-	if(!findChunk(stream, ID_EXTENSION, (uint32*)&length, nil))
+	if(!findChunk(stream, ID_EXTENSION, &length, nil))
+		return false;
+	uint64 end = (uint64)stream->tell() + length;
+	if(end > UINT32_MAX)
 		return false;
 	while(length > 0){
-		if(!readChunkHeaderInfo(stream, &header))
+		if(length < 12 || !readChunkHeaderInfo(stream, &header) ||
+		   header.length > length - 12 || header.length > INT32_MAX)
 			return false;
-		length -= 12;
+		uint32 payloadStart = stream->tell();
+		bool handled = false;
 		FORLIST(lnk, this->plugins){
 			Plugin *p = PLG(lnk);
 			if(p->id == header.type && p->read){
-				p->read(stream, header.length,
-				        object, p->offset, p->size);
-				goto cont;
+				if(p->read(stream, header.length, object, p->offset, p->size) == nil)
+					return false;
+				handled = true;
+				break;
 			}
 		}
-		stream->seek(header.length);
-cont:
-		length -= header.length;
+		if(!handled)
+			stream->seek((int32)header.length);
+		if(stream->tell() != payloadStart + header.length)
+			return false;
+		length -= 12 + header.length;
 	}
+	if(stream->tell() != end)
+		return false;
 
 	// now the always callbacks
 	FORLIST(lnk, this->plugins){
@@ -134,19 +144,27 @@ PluginList::streamGetSize(void *object)
 	return size;
 }
 
-void
+bool
 PluginList::streamSkip(Stream *stream)
 {
-	int32 length;
+	uint32 length;
 	ChunkHeaderInfo header;
-	if(!findChunk(stream, ID_EXTENSION, (uint32*)&length, nil))
-		return;
+	if(!findChunk(stream, ID_EXTENSION, &length, nil))
+		return false;
+	uint64 end = (uint64)stream->tell() + length;
+	if(end > UINT32_MAX)
+		return false;
 	while(length > 0){
-		if(!readChunkHeaderInfo(stream, &header))
-			return;
-		stream->seek(header.length);
+		if(length < 12 || !readChunkHeaderInfo(stream, &header) ||
+		   header.length > length - 12 || header.length > INT32_MAX)
+			return false;
+		uint32 payloadStart = stream->tell();
+		stream->seek((int32)header.length);
+		if(stream->tell() != payloadStart + header.length)
+			return false;
 		length -= 12 + header.length;
 	}
+	return stream->tell() == end;
 }
 
 void

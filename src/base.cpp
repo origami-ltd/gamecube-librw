@@ -701,11 +701,10 @@ void
 memNative32_func(void *data, uint32 size)
 {
 	uint8 *bytes = (uint8*)data;
-	uint32 *words = (uint32*)data;
 	size >>= 2;
 	while(size--){
-		*words++ = (uint32)bytes[0] | (uint32)bytes[1]<<8 |
-			(uint32)bytes[2]<<16 | (uint32)bytes[3]<<24;
+		uint32 value = readLE32(bytes);
+		memcpy(bytes, &value, sizeof(value));
 		bytes += 4;
 	}
 }
@@ -714,10 +713,10 @@ void
 memNative16_func(void *data, uint32 size)
 {
 	uint8 *bytes = (uint8*)data;
-	uint16 *words = (uint16*)data;
 	size >>= 1;
 	while(size--){
-		*words++ = (uint16)bytes[0] | (uint16)bytes[1]<<8;
+		uint16 value = readLE16(bytes);
+		memcpy(bytes, &value, sizeof(value));
 		bytes += 2;
 	}
 }
@@ -727,14 +726,14 @@ memLittle32_func(void *data, uint32 size)
 {
 	uint32 w;
 	uint8 *bytes = (uint8*)data;
-	uint32 *words = (uint32*)data;
 	size >>= 2;
 	while(size--){
-		w = *words++;
-		*bytes++ = w;
-		*bytes++ = w >> 8;
-		*bytes++ = w >> 16;
-		*bytes++ = w >> 24;
+		memcpy(&w, bytes, sizeof(w));
+		bytes[0] = w;
+		bytes[1] = w >> 8;
+		bytes[2] = w >> 16;
+		bytes[3] = w >> 24;
+		bytes += 4;
 	}
 }
 
@@ -743,12 +742,12 @@ memLittle16_func(void *data, uint32 size)
 {
 	uint16 w;
 	uint8 *bytes = (uint8*)data;
-	uint16 *words = (uint16*)data;
 	size >>= 1;
 	while(size--){
-		w = *words++;
-		*bytes++ = (uint8)w;
-		*bytes++ = w >> 8;
+		memcpy(&w, bytes, sizeof(w));
+		bytes[0] = w;
+		bytes[1] = w >> 8;
+		bytes += 2;
 	}
 }
 
@@ -756,17 +755,23 @@ uint32
 Stream::write32(const void *data, uint32 length)
 {
 #ifdef BIGENDIAN
+	if(length & 3)
+		return 0;
 	uint8 *src = (uint8*)data;
 	uint32 buf[256];
 	int32 n, len;
-	for(len = length >>= 2; len > 0; len -= 256){
+	uint32 written = 0;
+	for(len = length >> 2; len > 0; len -= 256){
 		n = len < 256 ? len : 256;
 		memcpy(buf, src, n*4);
 		memLittle32(buf, n*4);
-		write8(buf, n*4);
+		uint32 bytes = write8(buf, n*4);
+		written += bytes;
+		if(bytes != (uint32)n*4)
+			return written;
 		src += n*4;
 	}
-	return length;
+	return written;
 #else
 	return write8(data, length);
 #endif
@@ -776,17 +781,23 @@ uint32
 Stream::write16(const void *data, uint32 length)
 {
 #ifdef BIGENDIAN
+	if(length & 1)
+		return 0;
 	uint8 *src = (uint8*)data;
 	uint16 buf[256];
 	int32 n, len;
-	for(len = length >>= 1; len > 0; len -= 256){
+	uint32 written = 0;
+	for(len = length >> 1; len > 0; len -= 256){
 		n = len < 256 ? len : 256;
 		memcpy(buf, src, n*2);
 		memLittle16(buf, n*2);
-		write8(buf, n*2);
+		uint32 bytes = write8(buf, n*2);
+		written += bytes;
+		if(bytes != (uint32)n*2)
+			return written;
 		src += n*2;
 	}
-	return length;
+	return written;
 #else
 	return write8(data, length);
 #endif
@@ -797,7 +808,7 @@ Stream::read32(void *data, uint32 length)
 {
 	uint32 ret;
 	ret = read8(data, length);
-	memNative32(data, length);
+	memNative32(data, ret & ~3U);
 	return ret;
 }
 
@@ -806,7 +817,7 @@ Stream::read16(void *data, uint32 length)
 {
 	uint32 ret;
 	ret = read8(data, length);
-	memNative16(data, length);
+	memNative16(data, ret & ~1U);
 	return ret;
 }
 
@@ -855,7 +866,7 @@ Stream::writeF32(float32 val)
 int8
 Stream::readI8(void)
 {
-	int8 tmp;
+	int8 tmp = 0;
 	read8(&tmp, sizeof(int8));
 	return tmp;
 }
@@ -863,7 +874,7 @@ Stream::readI8(void)
 uint8
 Stream::readU8(void)
 {
-	uint8 tmp;
+	uint8 tmp = 0;
 	read8(&tmp, sizeof(uint8));
 	return tmp;
 }
@@ -871,7 +882,7 @@ Stream::readU8(void)
 int16
 Stream::readI16(void)
 {
-	int16 tmp;
+	int16 tmp = 0;
 	read16(&tmp, sizeof(int16));
 	return tmp;
 }
@@ -879,7 +890,7 @@ Stream::readI16(void)
 uint16
 Stream::readU16(void)
 {
-	uint16 tmp;
+	uint16 tmp = 0;
 	read16(&tmp, sizeof(uint16));
 	return tmp;
 }
@@ -887,7 +898,7 @@ Stream::readU16(void)
 int32
 Stream::readI32(void)
 {
-	int32 tmp;
+	int32 tmp = 0;
 	read32(&tmp, sizeof(int32));
 	return tmp;
 }
@@ -895,7 +906,7 @@ Stream::readI32(void)
 uint32
 Stream::readU32(void)
 {
-	uint32 tmp;
+	uint32 tmp = 0;
 	read32(&tmp, sizeof(uint32));
 	return tmp;
 }
@@ -903,7 +914,7 @@ Stream::readU32(void)
 float32
 Stream::readF32(void)
 {
-	float32 tmp;
+	float32 tmp = 0.0f;
 	read32(&tmp, sizeof(float32));
 	return tmp;
 }
@@ -918,15 +929,15 @@ StreamMemory::close(void)
 uint32
 StreamMemory::write8(const void *data, uint32 len)
 {
-	if(this->eof())
+	if(this->eof() || this->position > this->capacity || this->length > this->capacity ||
+	   (len != 0 && data == nil))
 		return 0;
-	uint32 l = len;
-	if(this->position+l > this->length){
-		if(this->position+l > this->capacity)
-			l = this->capacity-this->position;
-		this->length = this->position+l;
-	}
-	memcpy(&this->data[this->position], data, l);
+	uint32 available = this->capacity - this->position;
+	uint32 l = len > available ? available : len;
+	if(this->position + l > this->length)
+		this->length = this->position + l;
+	if(l != 0)
+		memcpy(&this->data[this->position], data, l);
 	this->position += l;
 	if(len != l)
 		this->position = S_EOF;
@@ -936,12 +947,12 @@ StreamMemory::write8(const void *data, uint32 len)
 uint32
 StreamMemory::read8(void *data, uint32 len)
 {
-	if(this->eof())
+	if(this->eof() || this->position > this->length || (len != 0 && data == nil))
 		return 0;
-	uint32 l = len;
-	if(this->position+l > this->length)
-		l = this->length-this->position;
-	memcpy(data, &this->data[this->position], l);
+	uint32 available = this->length - this->position;
+	uint32 l = len > available ? available : len;
+	if(l != 0)
+		memcpy(data, &this->data[this->position], l);
 	this->position += l;
 	if(len != l)
 		this->position = S_EOF;
@@ -951,12 +962,24 @@ StreamMemory::read8(void *data, uint32 len)
 void
 StreamMemory::seek(int32 offset, int32 whence)
 {
+	if(this->eof())
+		return;
+	int64 position;
 	if(whence == 0)
-		this->position = offset;
+		position = offset;
 	else if(whence == 1)
-		this->position += offset;
-	else
-		this->position = this->length-offset;
+		position = (int64)this->position + offset;
+	else if(whence == 2)
+		position = (int64)this->length - offset;
+	else{
+		this->position = S_EOF;
+		return;
+	}
+	if(position < 0 || position > UINT32_MAX){
+		this->position = S_EOF;
+		return;
+	}
+	this->position = (uint32)position;
 	if(this->position > this->length){
 		// TODO: ideally this would depend on the mode
 		if(this->position > this->capacity)
@@ -981,6 +1004,13 @@ StreamMemory::eof(void)
 StreamMemory*
 StreamMemory::open(uint8 *data, uint32 length, uint32 capacity)
 {
+	if(data == nil && (length != 0 || capacity != 0)){
+		this->data = nil;
+		this->length = 0;
+		this->capacity = 0;
+		this->position = S_EOF;
+		return nil;
+	}
 	this->data = data;
 	this->capacity = capacity;
 	this->length = length;
@@ -1054,23 +1084,24 @@ writeChunkHeader(Stream *s, int32 type, int32 size)
 		int32 type, size;
 		uint32 id;
 	} buf = { type, size, libraryIDPack(version, build) };
-	s->write32(&buf, 12);
-	return true;
+	return s != nil && s->write32(&buf, 12) == 12;
 }
 
 bool
 readChunkHeaderInfo(Stream *s, ChunkHeaderInfo *header)
 {
+	if(s == nil || header == nil)
+		return false;
 	struct {
 		int32 type, size;
 		uint32 id;
 	} buf;
-	s->read32(&buf, 12);
-	if(s->eof())
+	if(s->read32(&buf, 12) != 12)
 		return false;
-	assert(header != nil);
+	if(buf.size < 0)
+		return false;
 	header->type = buf.type;
-	header->length = buf.size;
+	header->length = (uint32)buf.size;
 	header->version = libraryIDUnpackVersion(buf.id);
 	header->build = libraryIDUnpackBuild(buf.id);
 	return true;
@@ -1090,7 +1121,11 @@ findChunk(Stream *s, uint32 type, uint32 *length, uint32 *version)
 				*version = header.version;
 			return true;
 		}
+		if(header.length > INT32_MAX)
+			return false;
 		s->seek(header.length);
+		if(s->eof())
+			return false;
 	}
 	return false;
 }

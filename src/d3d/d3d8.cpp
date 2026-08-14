@@ -89,8 +89,10 @@ destroyNativeData(void *object, int32, int32)
 	geometry->instData = nil;
 	InstanceData *inst = header->inst;
 	for(uint32 i = 0; i < header->numMeshes; i++){
-		destroyIndexBuffer(inst->indexBuffer);
-		destroyVertexBuffer(inst->vertexBuffer);
+		if(inst->indexBuffer)
+			destroyIndexBuffer(inst->indexBuffer);
+		if(inst->vertexBuffer)
+			destroyVertexBuffer(inst->vertexBuffer);
 		inst++;
 	}
 	rwFree(header->inst);
@@ -98,66 +100,197 @@ destroyNativeData(void *object, int32, int32)
 	return object;
 }
 
-Stream*
-readNativeData(Stream *stream, int32, void *object, int32, int32)
+static void
+convertVertexData(uint8 *vertices, int32 numVertices, int32 stride,
+                  uint32 flags, int32 numTexCoords, bool toLittleEndian)
 {
-	ASSERTLITTLE;
+	for(int32 i = 0; i < numVertices; i++){
+		uint8 *vertex = &vertices[i*stride];
+		if(toLittleEndian)
+			memLittle32(vertex, 12);
+		else
+			memNative32(vertex, 12);
+		vertex += 12;
+		if(flags & Geometry::NORMALS){
+			if(toLittleEndian)
+				memLittle32(vertex, 12);
+			else
+				memNative32(vertex, 12);
+			vertex += 12;
+		}
+		if(flags & Geometry::PRELIT)
+			vertex += 4;
+		if(toLittleEndian)
+			memLittle32(vertex, numTexCoords*8);
+		else
+			memNative32(vertex, numTexCoords*8);
+	}
+}
+
+Stream*
+readNativeData(Stream *stream, int32 len, void *object, int32, int32)
+{
 	Geometry *geometry = (Geometry*)object;
 	uint32 platform;
-	if(!findChunk(stream, ID_STRUCT, nil, nil)){
+	if(len < 24)
+		return nil;
+	uint32 start = stream->tell();
+	uint32 structSize;
+	if(start == UINT32_MAX || !findChunk(stream, ID_STRUCT, &structSize, nil)){
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
-	platform = stream->readU32();
+	if(stream->tell() != start + 12 || structSize != (uint32)len - 12)
+		return nil;
+	uint8 nativeHeader[8];
+	if(stream->read8(nativeHeader, sizeof(nativeHeader)) != sizeof(nativeHeader))
+		return nil;
+	platform = readLE32(nativeHeader);
 	if(platform != PLATFORM_D3D8){
 		RWERROR((ERR_PLATFORM, platform));
 		return nil;
 	}
-	InstanceDataHeader *header = rwNewT(InstanceDataHeader, 1, MEMDUR_EVENT | ID_GEOMETRY);
-	geometry->instData = header;
-	header->platform = PLATFORM_D3D8;
-
-	int32 size = stream->readI32();
-	uint8 *data = rwNewT(uint8, size, MEMDUR_FUNCTION | ID_GEOMETRY);
-	stream->read8(data, size);
+	int32 size = (int32)readLE32(nativeHeader + 4);
+	if(size < 4 || (uint32)size > structSize - 8)
+		return nil;
+	uint8 *data = rwMallocT(uint8, size, MEMDUR_FUNCTION | ID_GEOMETRY);
+	if(data == nil)
+		return nil;
+	if(stream->read8(data, size) != (uint32)size){
+		rwFree(data);
+		return nil;
+	}
 	uint8 *p = data;
-	header->serialNumber = *(uint16*)p; p += 2;
-	header->numMeshes = *(uint16*)p; p += 2;
-	header->inst = rwNewT(InstanceData, header->numMeshes, MEMDUR_EVENT | ID_GEOMETRY);
+	uint16 serialNumber = readLE16(p); p += 2;
+	uint16 numMeshes = readLE16(p); p += 2;
+	if(numMeshes == 0 || (uint32)size != 4 + (uint32)numMeshes*0x2C ||
+	   geometry->meshHeader == nil || numMeshes != geometry->meshHeader->numMeshes){
+		rwFree(data);
+		return nil;
+	}
+
+	uint32 expectedStride = getStride(geometry->flags, geometry->numTexCoordSets);
+	uint32 expectedVertexShader = makeFVFDeclaration(geometry->flags, geometry->numTexCoordSets);
+	uint64 totalSize = 20 + (uint32)size;
+	p = data + 4;
+	Mesh *mesh = geometry->meshHeader->getMeshes();
+	for(uint32 i = 0; i < numMeshes; i++){
+		uint32 minVert = readLE32(p); p += 4;
+		int32 stride = (int32)readLE32(p); p += 4;
+		int32 numVertices = (int32)readLE32(p); p += 4;
+		int32 numIndices = (int32)readLE32(p); p += 4;
+		uint32 matid = readLE32(p); p += 4;
+		uint32 vertexShader = readLE32(p); p += 4;
+		uint32 primType = readLE32(p); p += 4;
+		p += 16;
+		uint64 vertexBytes = (uint64)(uint32)stride*(uint32)numVertices;
+		uint64 indexBytes = (uint64)(uint32)numIndices*2;
+		if(stride != (int32)expectedStride || vertexShader != expectedVertexShader ||
+		   numVertices < 0 || numIndices < 0 || geometry->matList.numMaterials < 0 ||
+		   matid >= (uint32)geometry->matList.numMaterials ||
+		   (uint32)numIndices != mesh[i].numIndices ||
+		   geometry->matList.materials[matid] != mesh[i].material ||
+		   primType != (geometry->meshHeader->flags == MeshHeader::TRISTRIP ?
+		               D3DPT_TRIANGLESTRIP : D3DPT_TRIANGLELIST) ||
+		   geometry->numVertices < 0 ||
+		   (uint64)minVert + (uint32)numVertices > (uint32)geometry->numVertices ||
+		   vertexBytes > 0xFFFFFFFF || totalSize + indexBytes + vertexBytes > (uint32)len){
+			rwFree(data);
+			return nil;
+		}
+		totalSize += indexBytes + vertexBytes;
+	}
+	if(totalSize != (uint32)len){
+		rwFree(data);
+		return nil;
+	}
+
+	InstanceDataHeader *header = rwMallocT(InstanceDataHeader, 1, MEMDUR_EVENT | ID_GEOMETRY);
+	if(header == nil){
+		rwFree(data);
+		return nil;
+	}
+	header->platform = PLATFORM_D3D8;
+	header->serialNumber = serialNumber;
+	header->numMeshes = numMeshes;
+	header->inst = rwMallocT(InstanceData, header->numMeshes, MEMDUR_EVENT | ID_GEOMETRY);
+	if(header->inst == nil){
+		rwFree(header);
+		rwFree(data);
+		return nil;
+	}
+	memset(header->inst, 0, header->numMeshes*sizeof(InstanceData));
+	geometry->instData = header;
 
 	InstanceData *inst = header->inst;
+	p = data + 4;
 	for(uint32 i = 0; i < header->numMeshes; i++){
-		inst->minVert = *(uint32*)p; p += 4;
-		inst->stride = *(uint32*)p; p += 4;
-		inst->numVertices = *(uint32*)p; p += 4;
-		inst->numIndices = *(uint32*)p; p += 4;
-		uint32 matid = *(uint32*)p; p += 4;
+		inst->minVert = readLE32(p); p += 4;
+		inst->stride = (int32)readLE32(p); p += 4;
+		inst->numVertices = (int32)readLE32(p); p += 4;
+		inst->numIndices = (int32)readLE32(p); p += 4;
+		uint32 matid = readLE32(p); p += 4;
 		inst->material = geometry->matList.materials[matid];
-		inst->vertexShader = *(uint32*)p; p += 4;
-		inst->primType = *(uint32*)p; p += 4;
+		inst->vertexShader = readLE32(p); p += 4;
+		inst->primType = readLE32(p); p += 4;
 		inst->indexBuffer = nil; p += 4;
 		inst->vertexBuffer = nil; p += 4;
 		inst->baseIndex = 0; p += 4;
 		inst->vertexAlpha = *p++;
 		inst->managed = 0; p++;
 		inst->remapped = 0; p++;	// TODO: really unused? and what's that anyway?
+		p++;
 		inst++;
 	}
 	rwFree(data);
 
 	inst = header->inst;
 	for(uint32 i = 0; i < header->numMeshes; i++){
+		uint32 indexBytes = (uint32)inst->numIndices*2;
+		uint32 vertexBytes = (uint32)inst->stride*(uint32)inst->numVertices;
 		assert(inst->indexBuffer == nil);
-		inst->indexBuffer = createIndexBuffer(inst->numIndices*2, false);
+		inst->indexBuffer = createIndexBuffer(indexBytes, false);
+		if(inst->indexBuffer == nil){
+			destroyNativeData(geometry, 0, 0);
+			return nil;
+		}
 		uint16 *indices = lockIndices(inst->indexBuffer, 0, 0, 0);
-		stream->read8(indices, 2*inst->numIndices);
+		if(indices == nil){
+			destroyNativeData(geometry, 0, 0);
+			return nil;
+		}
+		if(stream->read16(indices, indexBytes) != indexBytes){
+			unlockIndices(inst->indexBuffer);
+			destroyNativeData(geometry, 0, 0);
+			return nil;
+		}
+		for(int32 j = 0; j < inst->numIndices; j++)
+			if(indices[j] >= (uint32)inst->numVertices){
+				unlockIndices(inst->indexBuffer);
+				destroyNativeData(geometry, 0, 0);
+				return nil;
+			}
 		unlockIndices(inst->indexBuffer);
 
 		inst->managed = 1;
 		assert(inst->vertexBuffer == nil);
-		inst->vertexBuffer = createVertexBuffer(inst->stride*inst->numVertices, 0, false);
+		inst->vertexBuffer = createVertexBuffer(vertexBytes, 0, false);
+		if(inst->vertexBuffer == nil){
+			destroyNativeData(geometry, 0, 0);
+			return nil;
+		}
 		uint8 *verts = lockVertices(inst->vertexBuffer, 0, 0, D3DLOCK_NOSYSLOCK);
-		stream->read8(verts, inst->stride*inst->numVertices);
+		if(verts == nil){
+			destroyNativeData(geometry, 0, 0);
+			return nil;
+		}
+		if(stream->read8(verts, vertexBytes) != vertexBytes){
+			unlockVertices(inst->vertexBuffer);
+			destroyNativeData(geometry, 0, 0);
+			return nil;
+		}
+		convertVertexData(verts, inst->numVertices, inst->stride,
+		                  geometry->flags, geometry->numTexCoordSets, false);
 		unlockVertices(inst->vertexBuffer);
 
 		inst++;
@@ -168,7 +301,6 @@ readNativeData(Stream *stream, int32, void *object, int32, int32)
 Stream*
 writeNativeData(Stream *stream, int32 len, void *object, int32, int32)
 {
-	ASSERTLITTLE;
 	Geometry *geometry = (Geometry*)object;
 	writeChunkHeader(stream, ID_STRUCT, len-12);
 	if(geometry->instData == nil ||
@@ -178,42 +310,66 @@ writeNativeData(Stream *stream, int32 len, void *object, int32, int32)
 	InstanceDataHeader *header = (InstanceDataHeader*)geometry->instData;
 
 	int32 size = 4 + geometry->meshHeader->numMeshes*0x2C;
-	uint8 *data = rwNewT(uint8, size, MEMDUR_FUNCTION | ID_GEOMETRY);
+	uint8 *data = rwMallocT(uint8, size, MEMDUR_FUNCTION | ID_GEOMETRY);
+	if(data == nil)
+		return nil;
 	stream->writeI32(size);
 	uint8 *p = data;
-	*(uint16*)p = header->serialNumber; p += 2;
-	*(uint16*)p = header->numMeshes; p += 2;
+	writeLE16(p, header->serialNumber); p += 2;
+	writeLE16(p, header->numMeshes); p += 2;
 
 	InstanceData *inst = header->inst;
 	for(uint32 i = 0; i < header->numMeshes; i++){
-		*(uint32*)p = inst->minVert; p += 4;
-		*(uint32*)p = inst->stride; p += 4;
-		*(uint32*)p = inst->numVertices; p += 4;
-		*(uint32*)p = inst->numIndices; p += 4;
+		writeLE32(p, inst->minVert); p += 4;
+		writeLE32(p, inst->stride); p += 4;
+		writeLE32(p, inst->numVertices); p += 4;
+		writeLE32(p, inst->numIndices); p += 4;
 		int32 matid = geometry->matList.findIndex(inst->material);
-		*(int32*)p = matid; p += 4;
-		*(uint32*)p = inst->vertexShader; p += 4;
-		*(uint32*)p = inst->primType; p += 4;
-		*(uint32*)p = 0; p += 4;		// index buffer
-		*(uint32*)p = 0; p += 4;		// vertex buffer
-		*(uint32*)p = inst->baseIndex; p += 4;
+		writeLE32(p, matid); p += 4;
+		writeLE32(p, inst->vertexShader); p += 4;
+		writeLE32(p, inst->primType); p += 4;
+		writeLE32(p, 0); p += 4;
+		writeLE32(p, 0); p += 4;
+		writeLE32(p, inst->baseIndex); p += 4;
 		*p++ = inst->vertexAlpha;
 		*p++ = inst->managed;
 		*p++ = inst->remapped;
+		*p++ = 0;
 		inst++;
 	}
-	stream->write8(data, size);
+	uint32 writtenMetadata = stream->write8(data, size);
 	rwFree(data);
+	if(writtenMetadata != (uint32)size)
+		return nil;
 
 	inst = header->inst;
 	for(uint32 i = 0; i < header->numMeshes; i++){
+		uint32 indexBytes = (uint32)inst->numIndices*2;
+		uint32 vertexBytes = (uint32)inst->stride*(uint32)inst->numVertices;
 		uint16 *indices = lockIndices(inst->indexBuffer, 0, 0, 0);
-		stream->write8(indices, 2*inst->numIndices);
+		if(indices == nil || stream->write16(indices, indexBytes) != indexBytes){
+			if(indices)
+				unlockIndices(inst->indexBuffer);
+			return nil;
+		}
 		unlockIndices(inst->indexBuffer);
 
 		uint8 *verts = lockVertices(inst->vertexBuffer, 0, 0, D3DLOCK_NOSYSLOCK);
-		stream->write8(verts, inst->stride*inst->numVertices);
+		if(verts == nil)
+			return nil;
+		uint8 *littleEndianVertices = rwMallocT(uint8, vertexBytes, MEMDUR_FUNCTION | ID_GEOMETRY);
+		if(littleEndianVertices == nil){
+			unlockVertices(inst->vertexBuffer);
+			return nil;
+		}
+		memcpy(littleEndianVertices, verts, vertexBytes);
+		convertVertexData(littleEndianVertices, inst->numVertices, inst->stride,
+		                  geometry->flags, geometry->numTexCoordSets, true);
+		uint32 written = stream->write8(littleEndianVertices, vertexBytes);
+		rwFree(littleEndianVertices);
 		unlockVertices(inst->vertexBuffer);
+		if(written != vertexBytes)
+			return nil;
 		inst++;
 	}
 	return stream;
@@ -446,158 +602,305 @@ makeDefaultPipeline(void)
 
 // Native Texture and Raster
 
-// only handles 4 and 8 bit textures right now
+static bool
+readTextureBytes(Stream *stream, void *data, uint32 size, uint64 end)
+{
+	uint32 position = stream->tell();
+	if(position == UINT32_MAX || (uint64)position + size > end ||
+	   stream->read8(data, size) != size)
+		return false;
+	return stream->tell() == position + size;
+}
+
+static bool
+skipTextureBytes(Stream *stream, uint32 size, uint64 end)
+{
+	uint32 position = stream->tell();
+	if(position == UINT32_MAX || size > INT32_MAX || (uint64)position + size > end)
+		return false;
+	stream->seek((int32)size);
+	return stream->tell() == position + size;
+}
+
+static bool
+readTextureU32(Stream *stream, uint32 &value, uint64 end)
+{
+	uint8 data[4];
+	if(!readTextureBytes(stream, data, sizeof(data), end))
+		return false;
+	value = readLE32(data);
+	return true;
+}
+
 Raster*
-readAsImage(Stream *stream, int32 width, int32 height, int32 depth, int32 format, int32 numLevels)
+readAsImage(Stream *stream, int32 width, int32 height, int32 depth, int32 format,
+            int32 numLevels, uint64 end)
 {
 	uint8 palette[256*4];
 	int32 pallen = 0;
 	uint8 *data = nil;
+	uint32 dataCapacity = 0;
+	Raster *ras = nil;
+	if(width <= 0 || height <= 0 || numLevels <= 0 || numLevels > 32)
+		return nil;
+	uint32 start = stream->tell();
+	uint64 inputSize = 4*256;
+	for(int32 i = 0; i < numLevels; i++){
+		uint32 mipWidth = width >> i;
+		uint32 mipHeight = height >> i;
+		if(mipWidth == 0) mipWidth = 1;
+		if(mipHeight == 0) mipHeight = 1;
+		uint64 levelSize = (uint64)mipWidth*mipHeight;
+		if(levelSize > UINT32_MAX || inputSize + 4 + levelSize > UINT32_MAX)
+			return nil;
+		inputSize += 4 + levelSize;
+	}
+	uint64 imageStride = (uint64)(uint32)width*4;
+	uint64 imageSize = imageStride*(uint32)height;
+	if(start == UINT32_MAX || start > end || inputSize != end - start ||
+	   imageStride > INT32_MAX ||
+	   imageSize > INT32_MAX || imageSize > SIZE_MAX)
+		return nil;
 
 	Image *img = Image::create(width, height, 32);
+	if(img == nil)
+		return nil;
 	img->allocate();
-
-	if(format & Raster::PAL4){
-		pallen = 16;
-		stream->read8(palette, 4*32);
-	}else if(format & Raster::PAL8){
-		pallen = 256;
-		stream->read8(palette, 4*256);
+	if(img->pixels == nil){
+		img->destroy();
+		return nil;
 	}
+
+	if(format & Raster::PAL8){
+		pallen = 256;
+		if(!readTextureBytes(stream, palette, 4*pallen, end))
+			goto fail;
+	}else
+		goto fail;
 	if(!Raster::formatHasAlpha(format))
 		for(int32 i = 0; i < pallen; i++)
 			palette[i*4+3] = 0xFF;
 
-	Raster *ras = nil;
-
 	for(int i = 0; i < numLevels; i++){
-		uint32 size = stream->readU32();
+		uint32 size;
+		int32 mipWidth = width >> i;
+		int32 mipHeight = height >> i;
+		if(mipWidth < 1) mipWidth = 1;
+		if(mipHeight < 1) mipHeight = 1;
+		uint64 expected = (uint64)(uint32)mipWidth * (uint32)mipHeight;
+		if(expected > UINT32_MAX || !readTextureU32(stream, size, end) || size != expected)
+			goto fail;
 
-		// don't read levels that don't exist
 		if(ras && i >= ras->getNumLevels()){
-			stream->seek(size);
+			if(!skipTextureBytes(stream, size, end))
+				goto fail;
 			continue;
 		}
 
-		// one allocation is enough, first level is largest
-		if(data == nil)
+		if(data == nil){
 			data = rwNewT(uint8, size, MEMDUR_FUNCTION | ID_IMAGE);
-		stream->read8(data, size);
+			if(data == nil)
+				goto fail;
+			dataCapacity = size;
+		}
+		if(size > dataCapacity || !readTextureBytes(stream, data, size, end))
+			goto fail;
 
 		if(ras){
-			ras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
-			img->width = ras->width;
-			img->height = ras->height;
+			img->width = mipWidth;
+			img->height = mipHeight;
 			img->stride = img->width*img->bpp;
 		}
 
-		if(format & (Raster::PAL4 | Raster::PAL8)){
-			uint8 *idx = data;
-			uint8 *pixels = img->pixels;
-			for(int y = 0; y < img->height; y++){
-				uint8 *line = pixels;
-				for(int x = 0; x < img->width; x++){
-					line[0] = palette[*idx*4+0];
-					line[1] = palette[*idx*4+1];
-					line[2] = palette[*idx*4+2];
-					if(img->bpp > 3)
-						line[3] = palette[*idx*4+3];
-					line += img->bpp;
-					idx++;
-				}
-				pixels += img->stride;
+		uint8 *idx = data;
+		uint8 *pixels = img->pixels;
+		for(int y = 0; y < img->height; y++){
+			uint8 *line = pixels;
+			for(int x = 0; x < img->width; x++){
+				if(*idx >= pallen)
+					goto fail;
+				line[0] = palette[*idx*4+0];
+				line[1] = palette[*idx*4+1];
+				line[2] = palette[*idx*4+2];
+				line[3] = palette[*idx*4+3];
+				line += img->bpp;
+				idx++;
 			}
+			pixels += img->stride;
 		}
 
 		if(ras == nil){
-			// Important to have filled the image with data
 			int32 newformat;
-			Raster::imageFindRasterFormat(img, format&7, &width, &height, &depth, &newformat);
+			if(!Raster::imageFindRasterFormat(img, format&7, &width, &height, &depth, &newformat))
+				goto fail;
 			newformat |= format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
 			ras = Raster::create(width, height, depth, newformat);
-			ras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
+			if(ras == nil)
+				goto fail;
 		}
 
-		ras->setFromImage(img);
+		if(ras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH) == nil)
+			goto fail;
+		bool set = ras->setFromImage(img) != nil;
 		ras->unlock(i);
+		if(!set)
+			goto fail;
 	}
 
 	rwFree(data);
 	img->destroy();
 	return ras;
+
+fail:
+	if(ras)
+		ras->destroy();
+	rwFree(data);
+	img->destroy();
+	return nil;
 }
 
 Texture*
 readNativeTexture(Stream *stream)
 {
-	uint32 platform;
-	if(!findChunk(stream, ID_STRUCT, nil, nil)){
+	uint32 structSize;
+	uint8 header[88];
+	uint32 platform, format, hasAlphaValue;
+	int32 width, height, depth, numLevels, type, compression;
+	int32 pallength = 0;
+	int32 maxLevels;
+	uint64 structEnd;
+	Texture *tex = nil;
+	Raster *raster = nil;
+	D3dRaster *ras = nil;
+
+	if(stream == nil || !findChunk(stream, ID_STRUCT, &structSize, nil)){
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
-	platform = stream->readU32();
+	structEnd = (uint64)stream->tell() + structSize;
+	if(structSize < sizeof(header) || structEnd > UINT32_MAX ||
+	   !readTextureBytes(stream, header, sizeof(header), structEnd))
+		return nil;
+	platform = readLE32(&header[0]);
 	if(platform != PLATFORM_D3D8){
 		RWERROR((ERR_PLATFORM, platform));
 		return nil;
 	}
-	Texture *tex = Texture::create(nil);
-	if(tex == nil)
+	format = readLE32(&header[72]);
+	hasAlphaValue = readLE32(&header[76]);
+	width = readLE16(&header[80]);
+	height = readLE16(&header[82]);
+	depth = header[84];
+	numLevels = header[85];
+	type = header[86];
+	compression = header[87];
+	uint32 baseFormat = format & 0xF00;
+	uint32 allowedFormatFlags = 0xF00 | Raster::AUTOMIPMAP | Raster::PAL8 |
+	                            Raster::PAL4 | Raster::MIPMAP;
+	bool validBaseFormat = baseFormat == Raster::C1555 || baseFormat == Raster::C565 ||
+	                       baseFormat == Raster::C4444 || baseFormat == Raster::LUM8 ||
+	                       baseFormat == Raster::C8888 || baseFormat == Raster::C888 ||
+	                       baseFormat == Raster::C555;
+	if(memchr(&header[8], '\0', 32) == nil || memchr(&header[40], '\0', 32) == nil ||
+	   width <= 0 || height <= 0 || hasAlphaValue > 1 || type != Raster::TEXTURE ||
+	   !validBaseFormat || (format & ~allowedFormatFlags) != 0 ||
+	   ((format & Raster::PAL4) && (format & Raster::PAL8)) ||
+	   (format & Raster::AUTOMIPMAP && !(format & Raster::MIPMAP)))
 		return nil;
-
-	// Texture
-	tex->filterAddressing = stream->readU32();
-	stream->read8(tex->name, 32);
-	stream->read8(tex->mask, 32);
-
-	// Raster
-	uint32 format = stream->readU32();
-	bool32 hasAlpha = stream->readI32();
-	int32 width = stream->readU16();
-	int32 height = stream->readU16();
-	int32 depth = stream->readU8();
-	int32 numLevels = stream->readU8();
-	int32 type = stream->readU8();
-	int32 compression = stream->readU8();
-
-	int32 pallength = 0;
-	if(format & Raster::PAL4 || format & Raster::PAL8){
-		pallength = format & Raster::PAL4 ? 32 : 256;
-		if(!d3d::isP8supported){
-			tex->raster = readAsImage(stream, width, height, depth, format|type, numLevels);
-			return tex;
-		}
+	maxLevels = Raster::calculateNumLevels(width, height);
+	if(numLevels <= 0 || numLevels > maxLevels ||
+	   (numLevels > 1 && !(format & Raster::MIPMAP)) ||
+	   (compression != 0 && compression != 1 && compression != 3 && compression != 5))
+		return nil;
+	if(compression){
+		if(format & (Raster::PAL4 | Raster::PAL8) || (depth != 16 && depth != 32))
+			return nil;
+	}else if(format & Raster::PAL4){
+		if(depth != 4)
+			return nil;
+		pallength = 32;
+	}else if(format & Raster::PAL8){
+		if(depth != 8)
+			return nil;
+		pallength = 256;
+	}else{
+		int32 expectedDepth = baseFormat == Raster::LUM8 ? 8 :
+		                      baseFormat == Raster::C8888 ? 32 :
+		                      baseFormat == Raster::C888 ? 24 : 16;
+		if(depth != expectedDepth)
+			return nil;
 	}
 
-	Raster *raster;
-	D3dRaster *ras;
+	tex = Texture::create(nil);
+	if(tex == nil)
+		return nil;
+	tex->filterAddressing = readLE32(&header[4]);
+	memcpy(tex->name, &header[8], 32);
+	memcpy(tex->mask, &header[40], 32);
+	if(pallength != 0 && !d3d::isP8supported){
+		if(format & Raster::PAL4)
+			goto fail;
+		raster = readAsImage(stream, width, height, depth, format|type, numLevels, structEnd);
+		if(raster == nil || stream->tell() != structEnd)
+			goto fail;
+		tex->raster = raster;
+		return tex;
+	}
+
 	if(compression){
 		raster = Raster::create(width, height, depth, format | type | Raster::DONTALLOCATE, PLATFORM_D3D8);
+		if(raster == nil)
+			goto fail;
+		tex->raster = raster;
 		ras = GETD3DRASTEREXT(raster);
-		allocateDXT(raster, compression, numLevels, hasAlpha);
+		allocateDXT(raster, compression, numLevels, hasAlphaValue);
+		if(ras->texture == nil)
+			goto fail;
 		ras->customFormat = 1;
 	}else{
 		raster = Raster::create(width, height, depth, format | type, PLATFORM_D3D8);
+		if(raster == nil)
+			goto fail;
+		tex->raster = raster;
 		ras = GETD3DRASTEREXT(raster);
 	}
-	tex->raster = raster;
 
-	// TODO: check if format supported and convert if necessary
+	if(raster->getNumLevels() < numLevels ||
+	   (pallength != 0 && (ras->palette == nil ||
+	    !readTextureBytes(stream, ras->palette, 4*pallength, structEnd))))
+		goto fail;
 
-	if(pallength != 0)
-		stream->read8(ras->palette, 4*pallength);
-
-	uint32 size;
-	uint8 *data;
 	for(int32 i = 0; i < numLevels; i++){
-		size = stream->readU32();
-		if(i < raster->getNumLevels()){
-			data = raster->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
-			stream->read8(data, size);
-			raster->unlock(i);
+		uint32 size;
+		if(!readTextureU32(stream, size, structEnd))
+			goto fail;
+		uint32 expectedSize;
+		if(compression){
+			uint32 levelWidth = width >> i;
+			uint32 levelHeight = height >> i;
+			if(levelWidth == 0) levelWidth = 1;
+			if(levelHeight == 0) levelHeight = 1;
+			expectedSize = getDXTDataSize(compression, levelWidth, levelHeight);
 		}else
-			stream->seek(size);
+			expectedSize = getLevelSize(raster, i);
+		if(expectedSize == 0 || size != expectedSize)
+			goto fail;
+		uint8 *data = raster->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
+		if(data == nil)
+			goto fail;
+		bool read = readTextureBytes(stream, data, size, structEnd);
+		raster->unlock(i);
+		if(!read)
+			goto fail;
 	}
+	if(stream->tell() != structEnd)
+		goto fail;
 	return tex;
+
+fail:
+	if(tex)
+		tex->destroy();
+	return nil;
 }
 
 void
@@ -620,7 +923,8 @@ writeNativeTexture(Texture *tex, Stream *stream)
 	stream->writeI32(ras->hasAlpha);
 	stream->writeU16(raster->width);
 	stream->writeU16(raster->height);
-	stream->writeU8(raster->depth);
+	stream->writeU8(!ras->customFormat && (raster->format & 0xF00) == Raster::C888 ?
+	                24 : raster->depth);
 	stream->writeU8(numLevels);
 	stream->writeU8(raster->type);
 	int32 compression = 0;

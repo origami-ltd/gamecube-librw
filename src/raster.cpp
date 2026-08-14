@@ -59,7 +59,10 @@ Raster::create(int32 width, int32 height, int32 depth, int32 format, int32 platf
 {
 	// TODO: pass arguments through to the driver and create the raster there
 	Raster *raster = (Raster*)rwMalloc(s_plglist.size, MEMDUR_EVENT);	// TODO
-	assert(raster != nil);
+	if(raster == nil){
+		RWERROR((ERR_ALLOC, s_plglist.size));
+		return nil;
+	}
 	numAllocated++;
 	raster->parent = raster;
 	raster->offsetX = 0;
@@ -77,7 +80,13 @@ Raster::create(int32 width, int32 height, int32 depth, int32 format, int32 platf
 	s_plglist.construct(raster);
 
 //	printf("%d %d %d %d\n", raster->type, raster->width, raster->height, raster->depth);
-	return engine->driver[raster->platform]->rasterCreate(raster);
+	Raster *result = engine->driver[raster->platform]->rasterCreate(raster);
+	if(result == nil){
+		s_plglist.destruct(raster);
+		rwFree(raster);
+		numAllocated--;
+	}
+	return result;
 }
 
 void
@@ -501,6 +510,8 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 {
 	using namespace rw;
 
+	if(ras == nil)
+		return nil;
 	if(ras->platform == rw::platform)
 		return ras;
 	// compatible platforms
@@ -532,23 +543,53 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 	// fall back to going through Image directly
 	int32 width, height, depth, format;
 	Image *img = ras->toImage();
+	if(img == nil)
+		return nil;
 	// TODO: maybe don't *always* do this?
 	img->unpalettize();
-	Raster::imageFindRasterFormat(img, Raster::TEXTURE, &width, &height, &depth, &format);
+	if(!Raster::imageFindRasterFormat(img, Raster::TEXTURE, &width, &height, &depth, &format)){
+		img->destroy();
+		return nil;
+	}
 	format |= ras->format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
 	Raster *newras = Raster::create(width, height, depth, format);
-	newras->setFromImage(img);
+	if(newras == nil || newras->setFromImage(img) == nil){
+		img->destroy();
+		if(newras)
+			newras->destroy();
+		return nil;
+	}
 	img->destroy();
 	int numLevels = ras->getNumLevels();
 	for(int i = 1; i < numLevels; i++){
-		ras->lock(i, Raster::LOCKREAD);
+		if(ras->lock(i, Raster::LOCKREAD) == nil){
+			newras->destroy();
+			return nil;
+		}
 		img = ras->toImage();
+		if(img == nil){
+			ras->unlock(i);
+			newras->destroy();
+			return nil;
+		}
 		// TODO: maybe don't *always* do this?
 		img->unpalettize();
-		newras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
-		newras->setFromImage(img);
+		if(newras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH) == nil){
+			img->destroy();
+			ras->unlock(i);
+			newras->destroy();
+			return nil;
+		}
+		if(newras->setFromImage(img) == nil){
+			newras->unlock(i);
+			img->destroy();
+			ras->unlock(i);
+			newras->destroy();
+			return nil;
+		}
 		newras->unlock(i);
 		ras->unlock(i);
+		img->destroy();
 	}
 	ras->destroy();
 	ras = newras;

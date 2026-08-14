@@ -21,8 +21,8 @@ namespace d3d {
 bool32 isP8supported = 1;	// set to 0 when actual d3d device is used
 
 // stolen from d3d8to9
-static uint32
-calculateTextureSize(uint32 width, uint32 height, uint32 depth, uint32 format)
+static uint64
+calculateTextureSize64(uint32 width, uint32 height, uint32 depth, uint32 format)
 {
 #define D3DFMT_W11V11U10 65
 	switch(format){
@@ -34,7 +34,7 @@ calculateTextureSize(uint32 width, uint32 height, uint32 depth, uint32 format)
 	case D3DFMT_P8:
 	case D3DFMT_L8:
 	case D3DFMT_A4L4:
-		return width * height * depth;
+		return (uint64)width * height * depth;
 	case D3DFMT_R5G6B5:
 	case D3DFMT_X1R5G5B5:
 	case D3DFMT_A1R5G5B5:
@@ -50,9 +50,9 @@ calculateTextureSize(uint32 width, uint32 height, uint32 depth, uint32 format)
 	case D3DFMT_D16:
 	case D3DFMT_UYVY:
 	case D3DFMT_YUY2:
-		return width * 2 * height * depth;
+		return (uint64)width * 2 * height * depth;
 	case D3DFMT_R8G8B8:
-		return width * 3 * height * depth;
+		return (uint64)width * 3 * height * depth;
 	case D3DFMT_A8R8G8B8:
 	case D3DFMT_X8R8G8B8:
 	case D3DFMT_A2B10G10R10:
@@ -68,18 +68,29 @@ calculateTextureSize(uint32 width, uint32 height, uint32 depth, uint32 format)
 	case D3DFMT_D24S8:
 	case D3DFMT_D24X8:
 	case D3DFMT_D24X4S4:
-		return width * 4 * height * depth;
+		return (uint64)width * 4 * height * depth;
 	case D3DFMT_DXT1:
-		assert(depth <= 1);
-		return ((width + 3) >> 2) * ((height + 3) >> 2) * 8;
+		if(depth > 1)
+			return 0;
+		return (((uint64)width + 3) >> 2) * (((uint64)height + 3) >> 2) * 8;
 	case D3DFMT_DXT2:
 	case D3DFMT_DXT3:
 	case D3DFMT_DXT4:
 	case D3DFMT_DXT5:
-		assert(depth <= 1);
-		return ((width + 3) >> 2) * ((height + 3) >> 2) * 16;
+		if(depth > 1)
+			return 0;
+		return (((uint64)width + 3) >> 2) * (((uint64)height + 3) >> 2) * 16;
 	}
 }
+
+#ifdef RW_D3D9
+static uint32
+calculateTextureSize(uint32 width, uint32 height, uint32 depth, uint32 format)
+{
+	uint64 size = calculateTextureSize64(width, height, depth, format);
+	return size <= UINT32_MAX ? (uint32)size : 0;
+}
+#endif
 
 int vertFormatMap[] = {
 	-1, VERT_FLOAT2, VERT_FLOAT3, VERT_FLOAT4, VERT_ARGB, VERT_RGBA /* blend indices */
@@ -217,20 +228,38 @@ createTexture(int32 width, int32 height, int32 numlevels, uint32 usage, uint32 f
 		d3d9Globals.numTextures++;
 	return tex;
 #else
+	if(width <= 0 || height <= 0 || numlevels < 0)
+		return nil;
+	if(numlevels == 0){
+		int32 dimension = width > height ? width : height;
+		while(dimension != 0){
+			numlevels++;
+			dimension /= 2;
+		}
+	}
+	if((size_t)(numlevels-1) > (SIZE_MAX-sizeof(RasterLevels))/sizeof(RasterLevels::Level))
+		return nil;
+	size_t metadataSize = sizeof(RasterLevels) + sizeof(RasterLevels::Level)*(size_t)(numlevels-1);
 	int32 w = width;
 	int32 h = height;
-	int32 size = 0;
+	size_t size = 0;
 	for(int32 i = 0; i < numlevels; i++){
-		size += calculateTextureSize(w, h, 1, format);
+		uint64 levelSize = calculateTextureSize64(w, h, 1, format);
+		if(levelSize == 0 || levelSize > INT32_MAX || levelSize > SIZE_MAX-size)
+			return nil;
+		size += (size_t)levelSize;
 		w /= 2;
 		if(w == 0) w = 1;
 		h /= 2;
 		if(h == 0) h = 1;
 	}
-	uint8 *data = (uint8*)rwNew(sizeof(RasterLevels)+sizeof(RasterLevels::Level)*(numlevels-1)+size,
-		MEMDUR_EVENT | ID_DRIVER);
+	if(metadataSize > SIZE_MAX-size)
+		return nil;
+	uint8 *data = (uint8*)rwNew(metadataSize+size, MEMDUR_EVENT | ID_DRIVER);
+	if(data == nil)
+		return nil;
 	RasterLevels *levels = (RasterLevels*)data;
-	data += sizeof(RasterLevels)+sizeof(RasterLevels::Level)*(numlevels-1);
+	data += metadataSize;
 	levels->numlevels = numlevels;
 	levels->format = format;
 	w = width;
@@ -239,7 +268,7 @@ createTexture(int32 width, int32 height, int32 numlevels, uint32 usage, uint32 f
 		levels->levels[i].width = w;
 		levels->levels[i].height = h;
 		levels->levels[i].data = data;
-		levels->levels[i].size = calculateTextureSize(w, h, 1, format);
+		levels->levels[i].size = (int32)calculateTextureSize64(w, h, 1, format);
 		data += levels->levels[i].size;
 		w /= 2;
 		if(w == 0) w = 1;
@@ -415,8 +444,11 @@ rasterCreateTexture(Raster *raster)
 	int32 levels;
 	D3dRaster *natras = GETD3DRASTEREXT(raster);
 
-	if(natras->format == D3DFMT_P8)
+	if(natras->format == D3DFMT_P8){
 		natras->palette = (uint8*)rwNew(4*256, MEMDUR_EVENT | ID_DRIVER);
+		if(natras->palette == nil)
+			return nil;
+	}
 	if(natras->autogenMipmap)
 		levels = 0;
 	else if(raster->format & Raster::MIPMAP)
@@ -843,7 +875,8 @@ rasterToImage(Raster *raster)
 
 	bool unlock = false;
 	if(raster->pixels == nil){
-		raster->lock(0, Raster::LOCKREAD);
+		if(raster->lock(0, Raster::LOCKREAD) == nil)
+			return nil;
 		unlock = true;
 	}
 
@@ -855,7 +888,18 @@ rasterToImage(Raster *raster)
 		if(w < 4) w = 4;
 		if(h < 4) h = 4;
 		image = Image::create(w, h, 32);
+		if(image == nil){
+			if(unlock)
+				raster->unlock(0);
+			return nil;
+		}
 		image->allocate();
+		if(image->pixels == nil){
+			image->destroy();
+			if(unlock)
+				raster->unlock(0);
+			return nil;
+		}
 		uint8 *pix = raster->pixels;
 		switch(natras->format){
 		case D3DFMT_DXT1:
@@ -908,6 +952,8 @@ rasterToImage(Raster *raster)
 	case Raster::C4444:
 	case Raster::LUM8:
 		RWERROR((ERR_INVRASTER));
+		if(unlock)
+			raster->unlock(0);
 		return nil;
 	}
 	int32 pallength = 0;
@@ -921,7 +967,18 @@ rasterToImage(Raster *raster)
 
 	uint8 *in, *out;
 	image = Image::create(raster->width, raster->height, depth);
+	if(image == nil){
+		if(unlock)
+			raster->unlock(0);
+		return nil;
+	}
 	image->allocate();
+	if(image->pixels == nil || (pallength && image->palette == nil)){
+		image->destroy();
+		if(unlock)
+			raster->unlock(0);
+		return nil;
+	}
 
 	if(pallength){
 		out = image->palette;

@@ -79,14 +79,25 @@ void
 Image::allocate(void)
 {
 	if(this->pixels == nil){
-		this->stride = this->width*this->bpp;
-		this->pixels = rwNewT(uint8, this->stride*this->height, MEMDUR_EVENT | ID_IMAGE);
+		if(this->width <= 0 || this->height <= 0 || this->bpp <= 0)
+			return;
+		uint64 stride = (uint64)(uint32)this->width*(uint32)this->bpp;
+		uint64 size = stride*(uint32)this->height;
+		if(stride > INT32_MAX || size > INT32_MAX || size > SIZE_MAX)
+			return;
+		uint8 *pixels = rwMallocT(uint8, (size_t)size, MEMDUR_EVENT | ID_IMAGE);
+		if(pixels == nil)
+			return;
+		this->stride = (int32)stride;
+		this->pixels = pixels;
 		this->flags |= 1;
 	}
-	if(this->palette == nil){
-		if(this->depth == 4 || this->depth == 8)
-			this->palette = rwNewT(uint8, (1 << this->depth)*4, MEMDUR_EVENT | ID_IMAGE);
-		this->flags |= 2;
+	if(this->palette == nil && (this->depth == 4 || this->depth == 8)){
+		uint8 *palette = rwMallocT(uint8, (1 << this->depth)*4, MEMDUR_EVENT | ID_IMAGE);
+		if(palette){
+			this->palette = palette;
+			this->flags |= 2;
+		}
 	}
 }
 
@@ -114,16 +125,14 @@ Image::setPixels(uint8 *pixels)
 void
 decompressDXT1(uint8 *adst, int32 w, int32 h, uint8 *src)
 {
-	/* j loops through old texels
-	 * x and y loop through new texels */
-	int32 x = 0, y = 0;
 	uint32 c[4][4];
 	uint8 idx[16];
 	uint8 (*dst)[4] = (uint8(*)[4])adst;
-	for(int32 j = 0; j < w*h/2; j += 8){
+	for(int32 y = 0; y < h; y += 4)
+	for(int32 x = 0; x < w; x += 4, src += 8){
 		/* calculate colors */
-		uint32 col0 = *((uint16*)&src[j+0]);
-		uint32 col1 = *((uint16*)&src[j+2]);
+		uint32 col0 = readLE16(&src[0]);
+		uint32 col1 = readLE16(&src[2]);
 		c[0][0] = ((col0>>11) & 0x1F)*0xFF/0x1F;
 		c[0][1] = ((col0>> 5) & 0x3F)*0xFF/0x3F;
 		c[0][2] = ( col0      & 0x1F)*0xFF/0x1F;
@@ -156,42 +165,35 @@ decompressDXT1(uint8 *adst, int32 w, int32 h, uint8 *src)
 		}
 
 		/* make index list */
-		uint32 indices = *((uint32*)&src[j+4]);
+		uint32 indices = readLE32(&src[4]);
 		for(int32 k = 0; k < 16; k++){
 			idx[k] = indices & 0x3;
 			indices >>= 2;
 		}
 
 		/* write bytes */
-		for(uint32 l = 0; l < 4; l++)
-			for(uint32 k = 0; k < 4; k++){
+		for(int32 l = 0; l < 4 && y+l < h; l++)
+			for(int32 k = 0; k < 4 && x+k < w; k++){
 				dst[(y+l)*w + x+k][0] = c[idx[l*4+k]][0];
 				dst[(y+l)*w + x+k][1] = c[idx[l*4+k]][1];
 				dst[(y+l)*w + x+k][2] = c[idx[l*4+k]][2];
 				dst[(y+l)*w + x+k][3] = c[idx[l*4+k]][3];
 			}
-		x += 4;
-		if(x >= w){
-			y += 4;
-			x = 0;
-		}
 	}
 }
 
 void
 decompressDXT3(uint8 *adst, int32 w, int32 h, uint8 *src)
 {
-	/* j loops through old texels
-	 * x and y loop through new texels */
-	int32 x = 0, y = 0;
 	uint32 c[4][4];
 	uint8 idx[16];
 	uint8 a[16];
 	uint8 (*dst)[4] = (uint8(*)[4])adst;
-	for(int32 j = 0; j < w*h; j += 16){
+	for(int32 y = 0; y < h; y += 4)
+	for(int32 x = 0; x < w; x += 4, src += 16){
 		/* calculate colors */
-		uint32 col0 = *((uint16*)&src[j+8]);
-		uint32 col1 = *((uint16*)&src[j+10]);
+		uint32 col0 = readLE16(&src[8]);
+		uint32 col1 = readLE16(&src[10]);
 		c[0][0] = ((col0>>11) & 0x1F)*0xFF/0x1F;
 		c[0][1] = ((col0>> 5) & 0x3F)*0xFF/0x3F;
 		c[0][2] = ( col0      & 0x1F)*0xFF/0x1F;
@@ -209,48 +211,41 @@ decompressDXT3(uint8 *adst, int32 w, int32 h, uint8 *src)
 		c[3][2] = (1*c[0][2] + 2*c[1][2])/3;
 
 		/* make index list */
-		uint32 indices = *((uint32*)&src[j+12]);
+		uint32 indices = readLE32(&src[12]);
 		for(int32 k = 0; k < 16; k++){
 			idx[k] = indices & 0x3;
 			indices >>= 2;
 		}
-		uint64 alphas = *((uint64*)&src[j+0]);
+		uint64 alphas = readLE64(&src[0]);
 		for(int32 k = 0; k < 16; k++){
 			a[k] = (alphas & 0xF)*17;
 			alphas >>= 4;
 		}
 
 		/* write bytes */
-		for(uint32 l = 0; l < 4; l++)
-			for(uint32 k = 0; k < 4; k++){
+		for(int32 l = 0; l < 4 && y+l < h; l++)
+			for(int32 k = 0; k < 4 && x+k < w; k++){
 				dst[(y+l)*w + x+k][0] = c[idx[l*4+k]][0];
 				dst[(y+l)*w + x+k][1] = c[idx[l*4+k]][1];
 				dst[(y+l)*w + x+k][2] = c[idx[l*4+k]][2];
 				dst[(y+l)*w + x+k][3] = a[l*4+k];
 			}
-		x += 4;
-		if(x >= w){
-			y += 4;
-			x = 0;
-		}
 	}
 }
 
 void
 decompressDXT5(uint8 *adst, int32 w, int32 h, uint8 *src)
 {
-	/* j loops through old texels
-	 * x and y loop through new texels */
-	int32 x = 0, y = 0;
 	uint32 c[4][4];
 	uint32 a[8];
 	uint8 idx[16];
 	uint8 aidx[16];
 	uint8 (*dst)[4] = (uint8(*)[4])adst;
-	for(int32 j = 0; j < w*h; j += 16){
+	for(int32 y = 0; y < h; y += 4)
+	for(int32 x = 0; x < w; x += 4, src += 16){
 		/* calculate colors */
-		uint32 col0 = *((uint16*)&src[j+8]);
-		uint32 col1 = *((uint16*)&src[j+10]);
+		uint32 col0 = readLE16(&src[8]);
+		uint32 col1 = readLE16(&src[10]);
 		c[0][0] = ((col0>>11) & 0x1F)*0xFF/0x1F;
 		c[0][1] = ((col0>> 5) & 0x3F)*0xFF/0x3F;
 		c[0][2] = ( col0      & 0x1F)*0xFF/0x1F;
@@ -276,8 +271,8 @@ decompressDXT5(uint8 *adst, int32 w, int32 h, uint8 *src)
 			c[3][2] = 0x00;
 		}
 
-		a[0] = src[j+0];
-		a[1] = src[j+1];
+		a[0] = src[0];
+		a[1] = src[1];
 		if(a[0] > a[1]){
 			a[2] = (6*a[0] + 1*a[1])/7;
 			a[3] = (5*a[0] + 2*a[1])/7;
@@ -295,32 +290,37 @@ decompressDXT5(uint8 *adst, int32 w, int32 h, uint8 *src)
 		}
 
 		/* make index list */
-		uint32 indices = *((uint32*)&src[j+12]);
+		uint32 indices = readLE32(&src[12]);
 		for(int32 k = 0; k < 16; k++){
 			idx[k] = indices & 0x3;
 			indices >>= 2;
 		}
 		// only 6 indices
-		uint64 alphas = *((uint64*)&src[j+2]);
+		uint64 alphas = readLE48(&src[2]);
 		for(int32 k = 0; k < 16; k++){
 			aidx[k] = alphas & 0x7;
 			alphas >>= 3;
 		}
 
 		/* write bytes */
-		for(uint32 l = 0; l < 4; l++)
-			for(uint32 k = 0; k < 4; k++){
+		for(int32 l = 0; l < 4 && y+l < h; l++)
+			for(int32 k = 0; k < 4 && x+k < w; k++){
 				dst[(y+l)*w + x+k][0] = c[idx[l*4+k]][0];
 				dst[(y+l)*w + x+k][1] = c[idx[l*4+k]][1];
 				dst[(y+l)*w + x+k][2] = c[idx[l*4+k]][2];
 				dst[(y+l)*w + x+k][3] = a[aidx[l*4+k]];
 			}
-		x += 4;
-		if(x >= w){
-			y += 4;
-			x = 0;
-		}
 	}
+}
+
+uint32
+getDXTDataSize(int32 type, uint32 width, uint32 height)
+{
+	if((type != 1 && type != 3 && type != 5) || width == 0 || height == 0)
+		return 0;
+	uint64 blocks = ((uint64)width + 3)/4 * (((uint64)height + 3)/4);
+	uint32 blockSize = type == 1 ? 8 : 16;
+	return blocks <= 0xFFFFFFFF/blockSize ? (uint32)(blocks*blockSize) : 0;
 }
 
 // not strictly image but related
@@ -393,14 +393,14 @@ flipAlphaBlock5(uint8 *dst, uint8 *src)
 	dst[0] = src[0];
 	dst[1] = src[1];
 	// bits
-	uint64 bits = *(uint64*)&src[2];
+	uint64 bits = readLE48(&src[2]);
 	uint64 flipbits = 0;
 	for(int i = 0; i < 4; i++){
 		flipbits <<= 12;
 		flipbits |= bits & 0xFFF;
 		bits >>= 12;
 	}
-	memcpy(dst+2, &flipbits, 6);
+	writeLE48(dst+2, flipbits);
 }
 
 // flip top 2 rows of a DXT5 3-bit alpha block
@@ -411,11 +411,11 @@ flipAlphaBlock5_half(uint8 *dst, uint8 *src)
 	dst[0] = src[0];
 	dst[1] = src[1];
 	// bits
-	uint64 bits = *(uint64*)&src[2];
+	uint64 bits = readLE48(&src[2]);
 	uint64 flipbits = bits & 0xFFFFFF000000;
 	flipbits |= (bits>>12) & 0xFFF;
 	flipbits |= (bits<<12) & 0xFFF000;
-	memcpy(dst+2, &flipbits, 6);
+	writeLE48(dst+2, flipbits);
 }
 
 void
@@ -546,6 +546,8 @@ flipDXT(int32 type, uint8 *dst, uint8 *src, uint32 width, uint32 height)
 void
 Image::setPixelsDXT(int32 type, uint8 *pixels)
 {
+	if(pixels == nil || this->pixels == nil || this->width <= 0 || this->height <= 0)
+		return;
 	switch(type){
 	case 1:
 		decompressDXT1(this->pixels, this->width, this->height, pixels);

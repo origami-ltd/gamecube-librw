@@ -236,6 +236,52 @@ extern MemoryFunctions managedMemfuncs;
 void printleaks(void);	// when using managed mem funcs
 
 namespace null {
+	struct Im2DVertex
+	{
+		float32 x, y, z, w;
+		RGBA color;
+		float32 u, v;
+
+		void setScreenX(float32 value) { x = value; }
+		void setScreenY(float32 value) { y = value; }
+		void setScreenZ(float32 value) { z = value; }
+		void setCameraZ(float32 value) { w = value; }
+		void setRecipCameraZ(float32 value) { w = 1.0f / value; }
+		void setColor(uint8 red, uint8 green, uint8 blue, uint8 alpha) { color = makeRGBA(red, green, blue, alpha); }
+		void setU(float32 value, float32) { u = value; }
+		void setV(float32 value, float32) { v = value; }
+
+		float32 getScreenX(void) { return x; }
+		float32 getScreenY(void) { return y; }
+		float32 getScreenZ(void) { return z; }
+		float32 getCameraZ(void) { return w; }
+		float32 getRecipCameraZ(void) { return 1.0f / w; }
+		RGBA getColor(void) { return color; }
+		float32 getU(void) { return u; }
+		float32 getV(void) { return v; }
+	};
+
+	struct Im3DVertex
+	{
+		V3d position;
+		RGBA color;
+		float32 u, v;
+
+		void setX(float32 value) { position.x = value; }
+		void setY(float32 value) { position.y = value; }
+		void setZ(float32 value) { position.z = value; }
+		void setColor(uint8 red, uint8 green, uint8 blue, uint8 alpha) { color = makeRGBA(red, green, blue, alpha); }
+		void setU(float32 value) { u = value; }
+		void setV(float32 value) { v = value; }
+
+		float32 getX(void) { return position.x; }
+		float32 getY(void) { return position.y; }
+		float32 getZ(void) { return position.z; }
+		RGBA getColor(void) { return color; }
+		float32 getU(void) { return u; }
+		float32 getV(void) { return v; }
+	};
+
 	void beginUpdate(Camera*);
 	void endUpdate(Camera*);
 	void clearCamera(Camera*, RGBA *col, uint32 mode);

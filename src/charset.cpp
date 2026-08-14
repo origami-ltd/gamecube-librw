@@ -12,11 +12,10 @@
 #include "ps2/rwps2.h"
 #include "d3d/rwd3d.h"
 #include "gl/rwgl3.h"
+#include "gx/rwgx.h"
 
 
 #define PLUGIN_ID 1000	// TODO: find a better ID
-
-#ifndef RW_NULL
 
 #ifdef RWHALFPIXEL
 #define HALFPX (0.5f)
@@ -239,6 +238,3 @@ Charset::printBuffered(const char *str, int32 x, int32 y, bool32 hideSpaces)
 }
 
 }
-
-#endif
-

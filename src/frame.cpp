@@ -9,6 +9,8 @@
 #include "rwobjects.h"
 #include "rwengine.h"
 
+#include <string.h>
+
 #define PLUGIN_ID ID_FRAMELIST
 
 namespace rw {
@@ -367,25 +369,42 @@ FrameList_*
 FrameList_::streamRead(Stream *stream)
 {
 	FrameStreamData buf;
+	uint32 structSize;
 	this->numFrames = 0;
 	this->frames = nil;
-	if(!findChunk(stream, ID_STRUCT, nil, nil)){
+	if(!findChunk(stream, ID_STRUCT, &structSize, nil)){
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
-	this->numFrames = stream->readI32();
+	if(structSize < 4 || stream->read32(&this->numFrames, sizeof(this->numFrames)) != sizeof(this->numFrames) ||
+	   this->numFrames < 0 || (uint32)this->numFrames > (structSize - 4)/sizeof(FrameStreamData) ||
+	   structSize != 4 + (uint32)this->numFrames*sizeof(FrameStreamData))
+		return nil;
+	if(this->numFrames == 0)
+		return this;
 	this->frames = (Frame**)rwMalloc(this->numFrames*sizeof(Frame*), MEMDUR_EVENT | ID_FRAMELIST);
 	if(this->frames == nil){
 		RWERROR((ERR_ALLOC, this->numFrames*sizeof(Frame*)));
 		return nil;
 	}
+	memset(this->frames, 0, this->numFrames*sizeof(Frame*));
 	for(int32 i = 0; i < this->numFrames; i++){
 		Frame *f;
-		stream->read32(&buf, sizeof(buf));
+		if(stream->read32(&buf, sizeof(buf)) != sizeof(buf) || buf.parent < -1 || buf.parent >= i){
+			for(int32 j = i-1; j >= 0; j--)
+				this->frames[j]->destroy();
+			rwFree(this->frames);
+			this->frames = nil;
+			this->numFrames = 0;
+			return nil;
+		}
 		this->frames[i] = f = Frame::create();
 		if(f == nil){
-			// TODO: clean up frames?
+			for(int32 j = i-1; j >= 0; j--)
+				this->frames[j]->destroy();
 			rwFree(this->frames);
+			this->frames = nil;
+			this->numFrames = 0;
 			return nil;
 		}
 		f->matrix.right = buf.right;
@@ -399,7 +418,14 @@ FrameList_::streamRead(Stream *stream)
 			this->frames[buf.parent]->addChild(f, rw::streamAppendFrames);
 	}
 	for(int32 i = 0; i < this->numFrames; i++)
-		Frame::s_plglist.streamRead(stream, this->frames[i]);
+		if(!Frame::s_plglist.streamRead(stream, this->frames[i])){
+			for(int32 j = this->numFrames-1; j >= 0; j--)
+				this->frames[j]->destroy();
+			rwFree(this->frames);
+			this->frames = nil;
+			this->numFrames = 0;
+			return nil;
+		}
 	return this;
 }
 

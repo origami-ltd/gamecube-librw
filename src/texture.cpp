@@ -179,27 +179,37 @@ TexDictionary::find(const char *name)
 TexDictionary*
 TexDictionary::streamRead(Stream *stream)
 {
-	if(!findChunk(stream, ID_STRUCT, nil, nil)){
+	uint32 structSize;
+	if(!findChunk(stream, ID_STRUCT, &structSize, nil) || structSize != 4){
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
-	int32 numTex = stream->readI16();
-	stream->readI16(); // device id (0 = unknown, 1 = d3d8, 2 = d3d9,
-	                   // 3 = gcn, 4 = null, 5 = opengl,
-	                   // 6 = ps2, 7 = softras, 8 = xbox, 9 = psp)
+	uint8 data[4];
+	if(stream->read8(data, sizeof(data)) != sizeof(data))
+		return nil;
+	int32 numTex = (int16)readLE16(data);
+	if(numTex < 0)
+		return nil;
 	TexDictionary *txd = TexDictionary::create();
 	if(txd == nil)
 		return nil;
 	Texture *tex;
 	for(int32 i = 0; i < numTex; i++){
-		if(!findChunk(stream, ID_TEXTURENATIVE, nil, nil)){
+		ChunkHeaderInfo header;
+		if(!readChunkHeaderInfo(stream, &header) || header.type != ID_TEXTURENATIVE){
 			RWERROR((ERR_CHUNK, "TEXTURENATIVE"));
 			goto fail;
 		}
+		uint64 nativeEnd = (uint64)stream->tell() + header.length;
+		if(nativeEnd > UINT32_MAX)
+			goto fail;
 		tex = Texture::streamReadNative(stream);
 		if(tex == nil)
 			goto fail;
-		Texture::s_plglist.streamRead(stream, tex);
+		if(!Texture::s_plglist.streamRead(stream, tex) || stream->tell() != nativeEnd){
+			tex->destroy();
+			goto fail;
+		}
 		txd->add(tex);
 	}
 	if(s_plglist.streamRead(stream, txd))
@@ -365,13 +375,16 @@ Texture::read(const char *name, const char *mask)
 Texture*
 Texture::streamRead(Stream *stream)
 {
-	uint32 length;
+	uint32 length, structSize;
 	char name[128], mask[128];
-	if(!findChunk(stream, ID_STRUCT, nil, nil)){
+	if(!findChunk(stream, ID_STRUCT, &structSize, nil) || structSize != 4){
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
-	uint32 filterAddressing = stream->readU32();
+	uint8 data[4];
+	if(stream->read8(data, sizeof(data)) != sizeof(data))
+		return nil;
+	uint32 filterAddressing = readLE32(data);
 	// if V addressing is 0, copy U
 	if((filterAddressing & 0xF000) == 0)
 		filterAddressing |= (filterAddressing&0xF00) << 4;
@@ -383,13 +396,17 @@ Texture::streamRead(Stream *stream)
 		RWERROR((ERR_CHUNK, "STRING"));
 		return nil;
 	}
-	stream->read8(name, length);
+	if(length == 0 || length > sizeof(name) || stream->read8(name, length) != length ||
+	   memchr(name, '\0', length) == nil)
+		return nil;
 
 	if(!findChunk(stream, ID_STRING, &length, nil)){
 		RWERROR((ERR_CHUNK, "STRING"));
 		return nil;
 	}
-	stream->read8(mask, length);
+	if(length == 0 || length > sizeof(mask) || stream->read8(mask, length) != length ||
+	   memchr(mask, '\0', length) == nil)
+		return nil;
 
 	bool32 mipState = getMipmapping();
 	bool32 autoMipState = getAutoMipmapping();
@@ -409,7 +426,8 @@ Texture::streamRead(Stream *stream)
 	setAutoMipmapping(autoMipState);
 
 	if(tex == nil){
-		s_plglist.streamSkip(stream);
+		if(!s_plglist.streamSkip(stream))
+			return nil;
 		return nil;
 	}
 	if(tex->refCount == 1)

@@ -36,6 +36,14 @@
 #define RWDEVICE ps2
 #endif
 
+#ifdef RW_NULL
+#define RWDEVICE null
+#endif
+
+#ifdef RW_GAMECUBE
+#define RWDEVICE gx
+#endif
+
 #ifdef RW_WDGL
 #define RW_OPENGL
 #endif
@@ -438,6 +446,65 @@ void memNative32_func(void *data, uint32 size);
 void memNative16_func(void *data, uint32 size);
 void memLittle32_func(void *data, uint32 size);
 void memLittle16_func(void *data, uint32 size);
+
+inline uint16
+readLE16(const void *data)
+{
+	const uint8 *bytes = (const uint8*)data;
+	return (uint16)bytes[0] | (uint16)bytes[1] << 8;
+}
+
+inline uint32
+readLE32(const void *data)
+{
+	const uint8 *bytes = (const uint8*)data;
+	return (uint32)bytes[0] | (uint32)bytes[1] << 8 |
+	       (uint32)bytes[2] << 16 | (uint32)bytes[3] << 24;
+}
+
+inline uint64
+readLE48(const void *data)
+{
+	const uint8 *bytes = (const uint8*)data;
+	return (uint64)bytes[0] | (uint64)bytes[1] << 8 |
+	       (uint64)bytes[2] << 16 | (uint64)bytes[3] << 24 |
+	       (uint64)bytes[4] << 32 | (uint64)bytes[5] << 40;
+}
+
+inline uint64
+readLE64(const void *data)
+{
+	const uint8 *bytes = (const uint8*)data;
+	return readLE48(bytes) | (uint64)bytes[6] << 48 | (uint64)bytes[7] << 56;
+}
+
+inline void
+writeLE16(void *data, uint16 value)
+{
+	uint8 *bytes = (uint8*)data;
+	bytes[0] = value;
+	bytes[1] = value >> 8;
+}
+
+inline void
+writeLE32(void *data, uint32 value)
+{
+	uint8 *bytes = (uint8*)data;
+	bytes[0] = value;
+	bytes[1] = value >> 8;
+	bytes[2] = value >> 16;
+	bytes[3] = value >> 24;
+}
+
+inline void
+writeLE48(void *data, uint64 value)
+{
+	uint8 *bytes = (uint8*)data;
+	for(int32 i = 0; i < 6; i++){
+		bytes[i] = value & 0xFF;
+		value >>= 8;
+	}
+}
 
 #ifdef BIGENDIAN
 inline void memNative32(void *data, uint32 size) { memNative32_func(data, size); }

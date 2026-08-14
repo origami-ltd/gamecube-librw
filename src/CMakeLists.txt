@@ -82,6 +82,10 @@ add_library(librw
     gl/glad/glad.c
     gl/glad/khrplatform.h
 
+    gx/gx.cpp
+    gx/gxraster.cpp
+    gx/rwgx.h
+
     lodepng/lodepng.h
     lodepng/lodepng.cpp
 

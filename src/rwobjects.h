@@ -339,6 +339,7 @@ void expandPal4_BE(uint8 *dst, uint32 dststride, uint8 *src, uint32 srcstride, i
 void compressPal4_BE(uint8 *dst, uint32 dststride, uint8 *src, uint32 srcstride, int32 w, int32 h);
 void copyPal8(uint8 *dst, uint32 dststride, uint8 *src, uint32 srcstride, int32 w, int32 h);
 
+uint32 getDXTDataSize(int32 type, uint32 width, uint32 height);
 void flipDXT(int32 type, uint8 *dst, uint8 *src, uint32 width, uint32 height);
 
 
