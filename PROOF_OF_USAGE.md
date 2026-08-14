@@ -18,7 +18,7 @@ period.
 ## The handshake
 
 ```
-SHA-256("SystemName:OperatorName:ISODate:https://github.com/ebellumat/librw-gamecube")
+SHA-256("SystemName:OperatorName:ISODate:https://github.com/ebellumat/gamecube-librw")
 ```
 
 Four fields, trimmed, joined by a single colon, UTF-8, lowercase hex. The same digest goes in the
@@ -27,7 +27,7 @@ compare — that is the whole mechanism. Compute it however you like:
 
 ```bash
 npx proof-of-usage hash --system "Model v2" --operator "Your Org" \
-  --work "https://github.com/ebellumat/librw-gamecube"
+  --work "https://github.com/ebellumat/gamecube-librw"
 ```
 
 ## Adding your row
