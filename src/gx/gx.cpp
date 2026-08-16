@@ -1632,6 +1632,19 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// color above, so none of them reach the GP any more. Passing white
 		// and no lights keeps the setup identical across every material in a
 		// run, which is what lets the memo skip the ~30 register writes.
+		// Build the colour cache even when staying immediate. The expression
+		// is the same one the per-vertex code computes, and it only changes
+		// with the ambient or the material — so computing it once per mesh and
+		// reading it per vertex removes six integer ops and four clamps from
+		// every vertex of every frame, with no change to what reaches the GP.
+		// This is the safe half of the indexed work: same descriptor, same
+		// bytes, just not recomputed.
+		const RGBA *cachedCol = nil;
+		if(!skinnedAtomic &&
+		   gxBuildColorCache(geo, gpk, prelit, numDir,
+		       ambR8, ambG8, ambB8, matcol))
+			cachedCol = gpk->colors;
+
 #if GX_USE_INDEXED
 		// All three attributes have to be arrays for this to be legal: packed
 		// positions and texcoords from gxPackGeometry, colours from the cache.
@@ -1783,18 +1796,23 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 				// takes. Measured as the difference between work17 (a missed
 				// retrace, 30fps) and fitting inside 16.6ms again.
 				if(numDir == 0){
-					int r8 = ambR8, g8 = ambG8, b8 = ambB8, a8 = 255;
-					if(prelitMesh){
-						r8 += prelit[vi].red;
-						g8 += prelit[vi].green;
-						b8 += prelit[vi].blue;
-						a8 = prelit[vi].alpha;
+					if(cachedCol){
+						const RGBA *c = &cachedCol[vi];
+						GX_Color4u8(c->red, c->green, c->blue, c->alpha);
+					}else{
+						int r8 = ambR8, g8 = ambG8, b8 = ambB8, a8 = 255;
+						if(prelitMesh){
+							r8 += prelit[vi].red;
+							g8 += prelit[vi].green;
+							b8 += prelit[vi].blue;
+							a8 = prelit[vi].alpha;
+						}
+						GX_Color4u8(
+						    (u8)mul255(clamp255i(r8), matcol.red),
+						    (u8)mul255(clamp255i(g8), matcol.green),
+						    (u8)mul255(clamp255i(b8), matcol.blue),
+						    (u8)mul255(a8, matcol.alpha));
 					}
-					GX_Color4u8(
-					    (u8)mul255(clamp255i(r8), matcol.red),
-					    (u8)mul255(clamp255i(g8), matcol.green),
-					    (u8)mul255(clamp255i(b8), matcol.blue),
-					    (u8)mul255(a8, matcol.alpha));
 					if(tex){
 						if(packUV)
 							GX_TexCoord2s16(packUV[2*vi], packUV[2*vi+1]);
