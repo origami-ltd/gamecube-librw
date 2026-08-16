@@ -36,6 +36,11 @@ void registerPlatformPlugins(void) { }
 extern "C" {
 void CdStreamFsLock(void);
 void CdStreamFsUnlock(void);
+// Streaming accounting, defined in Streaming.cpp. A tiled texture allocated
+// outside a load's measurement window is invisible to gResidentCost, so it is
+// charged here instead; one allocated inside is already in the heap delta.
+void CStreamingTexBytes(long delta);
+int CStreamingMeasuring(void);
 }
 namespace { struct DvdFsGuard {
 	DvdFsGuard(void) { CdStreamFsLock(); }
@@ -87,7 +92,8 @@ struct GxRaster
 	// zero at worst, so rebuilding the texture from it destroys a good one.
 	bool32 fabricated;
 	uint8 gxFmt; // GX_TF_CMPR or GX_TF_RGB5A3, chosen at first build
-	uint32 tiledSize; // so the free path can subtract exactly what it added
+	uint32 tiledSize;   // so the free path subtracts exactly what was added
+	bool32 tiledCharged; // whether that size went onto ms_memoryUsed
 };
 
 int32 nativeRasterOffset;
@@ -321,7 +327,10 @@ destroyNativeRaster(void *object, int32 offset, int32)
 	GxRaster *ext = PLUGINOFFSET(GxRaster, object, offset);
 	if(ext->tiled){
 		::gxTiledBytes -= ext->tiledSize;
+		if(ext->tiledCharged)
+			CStreamingTexBytes(-(long)ext->tiledSize);
 		ext->tiledSize = 0;
+		ext->tiledCharged = 0;
 		free(ext->tiled);
 		ext->tiled = nil;
 	}
@@ -601,8 +610,17 @@ gxGetTexture(Raster *raster)
 	int32 size = cmpr ? tw*th/2 : tw*th*2;
 	if(ext->tiled == nil){
 		ext->tiled = memalign(32, size);
-		if(ext->tiled)
-			ext->tiledSize = (uint32)size, ::gxTiledBytes += (uint32)size;
+		if(ext->tiled){
+			ext->tiledSize = (uint32)size;
+			::gxTiledBytes += (uint32)size;
+			// Only when the streamer is not already measuring this load: it
+			// tiles eagerly from rasterFromImage, and those bytes are inside
+			// the heap delta gResidentCost takes. Charging both would count
+			// them twice.
+			ext->tiledCharged = !CStreamingMeasuring();
+			if(ext->tiledCharged)
+				CStreamingTexBytes((long)size);
+		}
 		if(ext->tiled == nil){
 			// Counted, because this failing silently is what "black
 			// silhouettes with oom 0" actually is. The geometry loaded, this
