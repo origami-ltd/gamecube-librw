@@ -44,6 +44,10 @@ extern unsigned gxShowUs;   // whole showRaster duration
 // What the VI actually came up in, latched at startGX and reported by the
 // heartbeat — see startGX for why it cannot just be printed there.
 unsigned gxViTVMode, gxHaveComponent, gxXfbHeight, gxEfbHeight;
+// The boot console's framebuffer, handed down by the game so startGX can adopt
+// it rather than allocating a third one. See startGX.
+void *gxAdoptXfb;
+unsigned gxAdoptXfbSize;
 // Whether showRaster waits for the retrace. The game pushes m_PrefsVsync down
 // into this; defaults on so a build that never sets it behaves as before.
 unsigned gxWaitRetrace = 1;
@@ -152,7 +156,22 @@ startGX(void)
 	::gxXfbHeight = rmode->xfbHeight;
 	::gxEfbHeight = rmode->efbHeight;
 
-	xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+	// Adopt the boot console's framebuffer as our front buffer instead of
+	// allocating a third. psInitConsole already took one for the early printf
+	// console, that console is dead the moment the engine starts, and
+	// SYS_AllocateFramebuffer carves permanently out of the arena — it never
+	// gives anything back. Three buffers at 640x480x2 is 1.8MB of MEM1 for two
+	// buffers' worth of use.
+	//
+	// Only when the sizes match. gxAdoptXfbSize is what psInitConsole actually
+	// allocated; if the preferred mode it used differs from the progressive
+	// mode chosen above, the buffer is the wrong size and we allocate our own.
+	uint32 need = VIDEO_GetFrameBufferSize(rmode);
+	if(::gxAdoptXfb && ::gxAdoptXfbSize >= need){
+		xfb[0] = ::gxAdoptXfb;
+		::gxAdoptXfb = nil;   // handed over; the console must not draw again
+	}else
+		xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	currentXfb = 0;
 
