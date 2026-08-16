@@ -99,6 +99,16 @@ extern bool32 gxTexCacheDirty; // set by gxraster when a texture is (re)built
 // Tracked render state, applied by the 3D paths before drawing.
 static uint32 stZTest = 1, stZWrite = 1;
 static uint32 stVertexAlpha = 0;
+// Whether the bound texture carries an alpha channel. librw's other backends
+// blend when vertexAlpha OR textureAlpha is set (gl3device.cpp setRenderState
+// VERTEXALPHA / TEXTURERASTER, and d3ddevice.cpp does the same); this backend
+// only ever looked at vertexAlpha, so anything whose transparency comes from
+// its texture rather than from vertex or material alpha drew fully opaque.
+// That is the missing transparency on the pink mission markers and the missing
+// water spray from a hydrant — both are alpha-textured, and neither sets
+// rwRENDERSTATEVERTEXALPHAENABLE because on every other platform it does not
+// have to.
+static uint32 stTextureAlpha = 0;
 static uint32 stSrcBlend = BLENDSRCALPHA, stDstBlend = BLENDINVSRCALPHA;
 static uint32 stAlphaFunc = ALPHAGREATEREQUAL, stAlphaRef = 10;
 static uint32 stCullMode = CULLNONE;
@@ -615,7 +625,9 @@ gxBlend(uint32 blend)
 static void
 applyBlend(void)
 {
-	if(stVertexAlpha)
+	// vertexAlpha OR textureAlpha, matching gl3 and d3d9. Testing only
+	// vertexAlpha here is what made alpha-textured effects draw opaque.
+	if(stVertexAlpha || stTextureAlpha)
 		GX_SetBlendMode(GX_BM_BLEND, gxBlend(stSrcBlend),
 		    gxBlend(stDstBlend), GX_LO_CLEAR);
 	else
@@ -701,6 +713,9 @@ setRenderState(int32 state, void *pvalue)
 	switch(state){
 	case TEXTURERASTER:
 		currentTexRaster = (Raster*)pvalue;
+		stTextureAlpha = currentTexRaster &&
+		    gxRasterHasAlpha(currentTexRaster);
+		if(gxStarted) applyBlend();
 		break;
 	case ZTESTENABLE:
 		stZTest = value;
