@@ -679,6 +679,22 @@ gxFinishNativeRaster(Raster *raster, int32 tw, int32 th, uint32 size)
 // reader needs no knowledge of the source image at all.
 enum { GXNATIVE_HEADER = 88 };
 
+// Bounded log of why a native read gave up. A nil return here fails the whole
+// dictionary, and the streamer answers a failed load by requesting it again —
+// so one silent rejection becomes an endless retry that drains the heap while
+// streaming never advances. Worth naming the reason out loud.
+static int32 gxNativeLogLeft = 40;
+static void
+gxNativeFail(const char *why, uint32 a, uint32 b)
+{
+	if(gxNativeLogLeft-- <= 0)
+		return;
+	char line[128];
+	snprintf(line, sizeof(line), "NATIVE fail %s a=%u b=%u", why, a, b);
+	FILE *f = fopen("dvd:/native.log", "a");
+	if(f){ fprintf(f, "%s\n", line); fclose(f); }
+}
+
 Texture*
 readNativeTexture(Stream *stream)
 {
@@ -688,23 +704,30 @@ readNativeTexture(Stream *stream)
 		RWERROR((ERR_CHUNK, "STRUCT"));
 		return nil;
 	}
-	if(structSize < sizeof(header))
+	if(structSize < sizeof(header)){
+		gxNativeFail("structSize", structSize, sizeof(header));
 		return nil;
+	}
 	stream->read8(header, sizeof(header));
 	uint32 platform = readLE32(&header[0]);
 	if(platform != PLATFORM_GAMECUBE){
 		RWERROR((ERR_PLATFORM, platform));
+		gxNativeFail("platform", platform, PLATFORM_GAMECUBE);
 		return nil;
 	}
 	uint32 filterAddressing = readLE32(&header[4]);
-	if(memchr(&header[8], '\0', 32) == nil || memchr(&header[40], '\0', 32) == nil)
+	if(memchr(&header[8], '\0', 32) == nil || memchr(&header[40], '\0', 32) == nil){
+		gxNativeFail("name", 0, 0);
 		return nil;
+	}
 	uint32 format = readLE32(&header[72]);
 	int32 tw = readLE16(&header[80]);
 	int32 th = readLE16(&header[82]);
 	uint8 gxFmt = header[87];
-	if(tw <= 0 || th <= 0 || tw > 1024 || th > 1024)
+	if(tw <= 0 || th <= 0 || tw > 1024 || th > 1024){
+		gxNativeFail("dims", tw, th);
 		return nil;
+	}
 
 	Texture *tex = Texture::create(nil);
 	if(tex == nil)
@@ -716,6 +739,7 @@ readNativeTexture(Stream *stream)
 	uint32 size = stream->readU32();
 	uint32 expect = gxFmt == GXFMT_CMPR ? (uint32)tw*th/2 : (uint32)tw*th*2;
 	if(size != expect){
+		gxNativeFail("size", size, expect);
 		tex->destroy();
 		return nil;
 	}
@@ -723,12 +747,14 @@ readNativeTexture(Stream *stream)
 	Raster *raster = Raster::create(tw, th, 16, format | Raster::TEXTURE |
 	    Raster::DONTALLOCATE, PLATFORM_GAMECUBE);
 	if(raster == nil){
+		gxNativeFail("rastercreate", tw, th);
 		tex->destroy();
 		return nil;
 	}
 	GxRaster *ext = GETGXRASTEREXT(raster);
 	ext->tiled = gxAllocTiled(size);
 	if(ext->tiled == nil){
+		gxNativeFail("alloc", size, 0);
 		raster->destroy();
 		tex->destroy();
 		return nil;
