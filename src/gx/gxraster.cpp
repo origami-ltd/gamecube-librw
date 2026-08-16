@@ -46,6 +46,12 @@ namespace { struct DvdFsGuard {
 #define DVD_FS_GUARD DvdFsGuard DVD_FS_CAT(_dvdFsGuard_, __LINE__)
 
 
+// Texture allocations the streamer had to fail. Global scope, next to the
+// geometry counter it complements — rwGeoAllocFails alone reports "no OOM"
+// while every character on screen is a black silhouette, because the failure
+// is here and nothing was counting it.
+unsigned rwTexAllocFails;
+
 extern unsigned gxTexBuilds; // global counter, defined in gx.cpp
 extern unsigned gxTileUs;    // CPU time spent tiling textures this frame
 #include <ogc/lwp_watchdog.h>
@@ -577,8 +583,17 @@ gxGetTexture(Raster *raster)
 	int32 size = cmpr ? tw*th/2 : tw*th*2;
 	if(ext->tiled == nil){
 		ext->tiled = memalign(32, size);
-		if(ext->tiled == nil)
+		if(ext->tiled == nil){
+			// Counted, because this failing silently is what "black
+			// silhouettes with oom 0" actually is. The geometry loaded, this
+			// allocation did not, gxGetTexture hands back nil, and the mesh
+			// draws untextured — which reads as a lighting or a model bug and
+			// is neither. oom only ever counted geometry, so the one failure
+			// the budget was being tuned against was invisible to the readout
+			// used to tune it.
+			::rwTexAllocFails++;
 			return nil;
+		}
 	}
 	{
 		unsigned long long t0 = gettime();

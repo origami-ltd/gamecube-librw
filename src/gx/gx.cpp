@@ -159,31 +159,14 @@ startGX(void)
 	::gxXfbHeight = rmode->xfbHeight;
 	::gxEfbHeight = rmode->efbHeight;
 
-	// Adopt the boot console's framebuffer as our front buffer instead of
-	// allocating a third. psInitConsole already took one for the early printf
-	// console, that console is dead the moment the engine starts, and
-	// SYS_AllocateFramebuffer carves permanently out of the arena — it never
-	// gives anything back. Three buffers at 640x480x2 is 1.8MB of MEM1 for two
-	// buffers' worth of use.
-	//
-	// Only when the sizes match. gxAdoptXfbSize is what psInitConsole actually
-	// allocated; if the preferred mode it used differs from the progressive
-	// mode chosen above, the buffer is the wrong size and we allocate our own.
-	uint32 need = VIDEO_GetFrameBufferSize(rmode);
-	if(::gxAdoptXfb && ::gxAdoptXfbSize >= need){
-		xfb[0] = ::gxAdoptXfb;
-		// Point the libogc console at the reserved scratch at 0xC1700000 —
-		// the region the panic screen uses, which is never scanned out. Once
-		// this buffer belongs to the game, every later printf would otherwise
-		// paint text straight over the frame, which is exactly what it did:
-		// the console flashed log lines across the picture whenever anything
-		// printed. Redirecting is better than silencing, because the panic
-		// handler still wants a console and the output stays on the Gecko.
-		__console_init((void*)0xC1700000, 20, 20, rmode->fbWidth,
-		    rmode->xfbHeight, rmode->fbWidth*VI_DISPLAY_PIX_SZ);
-		::gxAdoptXfb = nil;
-	}else
-		xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+	// Reverted: adopting the boot console's framebuffer here to save 614KB
+	// corrupted the loading screen. That buffer already has console text
+	// written into it, the game does not cover every pixel of every frame, and
+	// the leftovers showed through as red blocks across the picture. The
+	// saving is real and still available, but it needs the buffer cleared at
+	// hand-over and the console redirected before anything else prints — not
+	// worth another broken boot to chase right now.
+	xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	currentXfb = 0;
 
