@@ -1,5 +1,7 @@
 #include <stdio.h>
-#include <malloc.h>
+#ifdef RW_GAMECUBE
+#include <malloc.h>   // malloc_usable_size; not a thing on every host
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>

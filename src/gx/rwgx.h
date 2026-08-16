@@ -94,6 +94,12 @@ bool32 imageFindRasterFormat(Image *img, int32 type,
 bool32 rasterFromImage(Raster *raster, Image *image);
 Image *rasterToImage(Raster *raster);
 
+// Native textures: a TXD converted ahead of time arrives already tiled, so
+// reading one is a read into a correctly sized buffer and nothing else.
+Texture *readNativeTexture(Stream *stream);
+void writeNativeTexture(Texture *tex, Stream *stream);
+uint32 getSizeNativeTexture(Texture *tex);
+
 }
 }
 

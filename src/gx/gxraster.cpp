@@ -636,6 +636,150 @@ rasterFromImageBody(Raster *raster, Image *image)
 	return 1;
 }
 
+// GX texture format ids as plain constants. The offline converter has to build
+// these same blobs on a host with no gccore.h, so nothing in the tiling or the
+// native-texture format may depend on the console headers.
+enum { GXFMT_RGB5A3 = 0x5, GXFMT_CMPR = 0xE };
+
+static void*
+gxAllocTiled(uint32 size)
+{
+	return memalign(32, size);
+}
+
+// Publish a tiled blob as a usable texture: flush it out of the CPU cache so
+// the GP sees it, then describe it to GX. Nothing here converts anything.
+static void
+gxFinishNativeRaster(Raster *raster, int32 tw, int32 th, uint32 size)
+{
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	DCFlushRange(ext->tiled, size);
+	GX_InitTexObj(&ext->obj, ext->tiled, tw, th, ext->gxFmt,
+	    GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
+	    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+	ext->hasTex = 1;
+	ext->dirty = 0;
+	gxTexCacheDirty = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Native GX textures.
+//
+// The point of these is that a TXD converted ahead of time arrives already
+// tiled, so loading one is a read into a correctly sized buffer and nothing
+// else. The runtime path this replaces had a D3D raster, a full RGBA8 Image
+// and an RGBA8 staging buffer live at the same time for every texture, which
+// is what shattered the heap: measured 12.3MB live across ~16300 allocations
+// with 4.4MB free split into ~9200 chunks. dca3 reaches the same conclusion
+// for the Dreamcast — convert offline, do no conversion at runtime.
+//
+// Header is RenderWare's usual 88-byte native texture struct. gxFmt rides in
+// the compression byte, and width/height are the *tiled* dimensions, so the
+// reader needs no knowledge of the source image at all.
+enum { GXNATIVE_HEADER = 88 };
+
+Texture*
+readNativeTexture(Stream *stream)
+{
+	uint32 structSize;
+	uint8 header[GXNATIVE_HEADER];
+	if(stream == nil || !findChunk(stream, ID_STRUCT, &structSize, nil)){
+		RWERROR((ERR_CHUNK, "STRUCT"));
+		return nil;
+	}
+	if(structSize < sizeof(header))
+		return nil;
+	stream->read8(header, sizeof(header));
+	uint32 platform = readLE32(&header[0]);
+	if(platform != PLATFORM_GAMECUBE){
+		RWERROR((ERR_PLATFORM, platform));
+		return nil;
+	}
+	uint32 filterAddressing = readLE32(&header[4]);
+	if(memchr(&header[8], '\0', 32) == nil || memchr(&header[40], '\0', 32) == nil)
+		return nil;
+	uint32 format = readLE32(&header[72]);
+	int32 tw = readLE16(&header[80]);
+	int32 th = readLE16(&header[82]);
+	uint8 gxFmt = header[87];
+	if(tw <= 0 || th <= 0 || tw > 1024 || th > 1024)
+		return nil;
+
+	Texture *tex = Texture::create(nil);
+	if(tex == nil)
+		return nil;
+	tex->filterAddressing = filterAddressing;
+	strncpy(tex->name, (char*)&header[8], 32);
+	strncpy(tex->mask, (char*)&header[40], 32);
+
+	uint32 size = stream->readU32();
+	uint32 expect = gxFmt == GXFMT_CMPR ? (uint32)tw*th/2 : (uint32)tw*th*2;
+	if(size != expect){
+		tex->destroy();
+		return nil;
+	}
+
+	Raster *raster = Raster::create(tw, th, 16, format | Raster::TEXTURE |
+	    Raster::DONTALLOCATE, PLATFORM_GAMECUBE);
+	if(raster == nil){
+		tex->destroy();
+		return nil;
+	}
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	ext->tiled = gxAllocTiled(size);
+	if(ext->tiled == nil){
+		raster->destroy();
+		tex->destroy();
+		return nil;
+	}
+	// Straight into its final home. No staging, no Image, no conversion.
+	stream->read8(ext->tiled, size);
+	ext->gxFmt = gxFmt;
+	gxFinishNativeRaster(raster, tw, th, size);
+	tex->raster = raster;
+	return tex;
+}
+
+void
+writeNativeTexture(Texture *tex, Stream *stream)
+{
+	Raster *raster = tex->raster;
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	int32 tw = raster->width, th = raster->height;
+	uint32 size = ext->gxFmt == GXFMT_CMPR ? (uint32)tw*th/2 : (uint32)tw*th*2;
+
+	writeChunkHeader(stream, ID_STRUCT, GXNATIVE_HEADER + 4 + size);
+	uint8 header[GXNATIVE_HEADER];
+	memset(header, 0, sizeof(header));
+	writeLE32(&header[0], PLATFORM_GAMECUBE);
+	writeLE32(&header[4], tex->filterAddressing);
+	strncpy((char*)&header[8], tex->name, 32);
+	strncpy((char*)&header[40], tex->mask, 32);
+	writeLE32(&header[72], raster->format);
+	writeLE32(&header[76], ext->gxFmt != GXFMT_CMPR);
+	writeLE16(&header[80], tw);
+	writeLE16(&header[82], th);
+	header[84] = 16;                 // depth of the tiled copy
+	header[85] = 1;                  // one level; mips are a later concern
+	header[86] = Raster::TEXTURE;
+	header[87] = ext->gxFmt;
+	stream->write8(header, sizeof(header));
+	stream->writeU32(size);
+	stream->write8(ext->tiled, size);
+}
+
+uint32
+getSizeNativeTexture(Texture *tex)
+{
+	Raster *raster = tex->raster;
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	uint32 size = ext->gxFmt == GXFMT_CMPR ?
+	    (uint32)raster->width*raster->height/2 :
+	    (uint32)raster->width*raster->height*2;
+	return 12 + GXNATIVE_HEADER + 4 + size;
+}
+
 Image*
 rasterToImage(Raster *raster)
 {

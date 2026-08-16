@@ -14,6 +14,9 @@
 #include "d3d/rwd3d.h"
 #include "d3d/rwxbox.h"
 #include "d3d/rwd3d8.h"
+#ifdef RW_GAMECUBE
+#include "gx/rwgx.h"
+#endif
 #include "d3d/rwd3d9.h"
 #include "d3d/rwd3dimpl.h"
 #include "gl/rwgl3.h"
@@ -499,6 +502,10 @@ Texture::streamReadNative(Stream *stream)
 		return xbox::readNativeTexture(stream);
 	if(platform == PLATFORM_GL3)
 		return gl3::readNativeTexture(stream);
+#ifdef RW_GAMECUBE
+	if(platform == PLATFORM_GAMECUBE)
+		return gx::readNativeTexture(stream);
+#endif
 	assert(0 && "unsupported platform");
 	return nil;
 }
@@ -516,6 +523,10 @@ Texture::streamWriteNative(Stream *stream)
 		xbox::writeNativeTexture(this, stream);
 	else if(this->raster->platform == PLATFORM_GL3)
 		gl3::writeNativeTexture(this, stream);
+#ifdef RW_GAMECUBE
+	else if(this->raster->platform == PLATFORM_GAMECUBE)
+		gx::writeNativeTexture(this, stream);
+#endif
 	else
 		assert(0 && "unsupported platform");
 }
@@ -533,6 +544,10 @@ Texture::streamGetSizeNative(void)
 		return xbox::getSizeNativeTexture(this);
 	if(this->raster->platform == PLATFORM_GL3)
 		return gl3::getSizeNativeTexture(this);
+#ifdef RW_GAMECUBE
+	if(this->raster->platform == PLATFORM_GAMECUBE)
+		return gx::getSizeNativeTexture(this);
+#endif
 	assert(0 && "unsupported platform");
 	return 0;
 }
