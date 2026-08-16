@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <assert.h>
 
 #include "../rwbase.h"
@@ -10,6 +11,8 @@
 #include "../rwobjects.h"
 #include "../rwengine.h"
 #include "../rwrender.h"
+#include "../rwanim.h"
+#include "../rwplugins.h"
 #include "rwgx.h"
 
 #define PLUGIN_ID ID_DRIVER
@@ -26,6 +29,22 @@ void registerPlatformPlugins(void) { }
 
 #include <gccore.h>
 #include <malloc.h>
+
+// libfat is shared with the game's streaming worker and must be serialised;
+// the lock lives in CdStream_gamecube.cpp. Declared rather than included
+// because librw does not get to see the game's headers.
+extern "C" {
+void CdStreamFsLock(void);
+void CdStreamFsUnlock(void);
+}
+namespace { struct DvdFsGuard {
+	DvdFsGuard(void) { CdStreamFsLock(); }
+	~DvdFsGuard(void) { CdStreamFsUnlock(); }
+}; }
+#define DVD_FS_CAT2(a, b) a##b
+#define DVD_FS_CAT(a, b) DVD_FS_CAT2(a, b)
+#define DVD_FS_GUARD DvdFsGuard DVD_FS_CAT(_dvdFsGuard_, __LINE__)
+
 
 extern unsigned gxTexBuilds; // global counter, defined in gx.cpp
 extern unsigned gxTileUs;    // CPU time spent tiling textures this frame
@@ -78,8 +97,184 @@ destroyGeoExt(void *object, int32 offset, int32)
 		}
 	free(g->lists);
 	free(g->sizes);
+	rwFree(g->packBase);
 	memset(g, 0, sizeof(*g));
 	return object;
+}
+
+uint32 gxPackSaved;
+uint32 gxPackGeoms, gxPackRefusedPos, gxPackRefusedUV;
+
+// Largest binary shift that keeps maxAbs inside int16, or -1 when even the
+// coarsest useful quantum would not hold it. Refusing is always safe: the
+// geometry stays on the float path and costs only the bytes we hoped to save.
+static int
+gxShiftFor(float maxAbs, int floorShift)
+{
+	if(maxAbs <= 0.0f)
+		return 15;
+	int s = 0;
+	while(s < 15 && maxAbs*(float)(1 << (s+1)) <= 32767.0f)
+		s++;
+	return s < floorShift ? -1 : s;
+}
+
+static inline int16
+gxQuant(float v, int shift)
+{
+	float q = v*(float)(1 << shift);
+	// The extents drove the shift, so this only clamps against rounding at
+	// the very edge — but an int16 overflow wraps to the opposite corner of
+	// the model, which draws as a spike across the map rather than as noise.
+	if(q > 32767.0f) return 32767;
+	if(q < -32768.0f) return -32768;
+	return (int16)(q < 0.0f ? q - 0.5f : q + 0.5f);
+}
+
+// Quantise positions and texcoords to int16 and release the float arrays they
+// came from.
+//
+// GX_SetVtxAttrFmt takes GX_S16 with a per-attribute binary shift, so nothing
+// is decoded at draw time: the value the GP reads IS the stored one, scaled by
+// a power of two the hardware applies for free. This is a reduction, not a
+// trade of memory against CPU — the vertex stream gets smaller too.
+//
+// Why it earns the surgery: after dropTrianglesAfterInstancing the RW arrays
+// cost about 26 bytes a vertex, of which positions are 12 and texcoords 8.
+// Replacing those 20 with 10 takes 38% off every loaded model, and
+// gResidentCost measures real heap bytes, so the streaming budget sees the
+// whole reduction and fits correspondingly more world. That is the safe half of
+// the trade the handoff draws: real bytes reclaimed at an UNCHANGED reserve,
+// not budget bought out of the headroom the exterior needs.
+//
+// The shift is chosen per geometry from its own extents, so precision follows
+// the model instead of a global guess. A model reaching 128 units lands on
+// shift 7 — 1/128 unit, the same quantum COMPRESSED_COL_VECTORS already uses
+// for every collision vertex in the game — and each doubling of the extent
+// costs exactly one bit of that. tools/gamecube/packtest.c pins the contract.
+//
+// Only called on streamed world geometry. Anything the game mutates after load
+// keeps its float arrays: CWaterLevel rewrites the wavy geometry's vertices
+// every frame, and skinned vertices are rebuilt every frame by definition.
+void
+gxPackGeometry(Geometry *geo)
+{
+	if(geo == nil || geo->numVertices <= 0 || (geo->flags & Geometry::NATIVE))
+		return;
+	GxGeoExt *g = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
+	if(g->packed & GXPACK_TRIED)
+		return;
+	g->packed |= GXPACK_TRIED;
+	if(geo->numMorphTargets != 1 || geo->morphTargets == nil)
+		return;
+	if(Skin::get(geo))
+		return;
+
+	MorphTarget *mt = &geo->morphTargets[0];
+	V3d *verts = mt->vertices;
+	if(verts == nil)
+		return;
+	int32 n = geo->numVertices;
+	TexCoords *uv = geo->numTexCoordSets == 1 ? geo->texCoords[0] : nil;
+
+	// Both blocks must have the exact layout Geometry::create built, or the
+	// pointer arithmetic below is writing into someone else's data. Check the
+	// structure rather than trusting it: morph vertices sit immediately after
+	// the MorphTarget array, texcoords immediately after the colours (the
+	// triangles that used to precede them are already gone).
+	uint8 *mbase = (uint8*)geo->morphTargets;
+	if((uint8*)verts != mbase + sizeof(MorphTarget))
+		return;
+	uint8 *abase = (uint8*)geo->attribBase;
+	size_t colSz = (geo->flags & Geometry::PRELIT) ? (size_t)n*sizeof(RGBA) : 0;
+	if(uv && (abase == nil || (uint8*)uv != abase + colSz))
+		uv = nil;
+
+	// Extents decide the quantum. Positions floor at 1/8 unit and texcoords at
+	// 1/512 uv — half a texel on a 256-wide texture, which is where quantised
+	// UVs start to show as texture swim on large tiled surfaces.
+	float maxP = 0.0f, maxT = 0.0f;
+	for(int32 i = 0; i < n; i++){
+		float a = fabsf(verts[i].x), b = fabsf(verts[i].y), c = fabsf(verts[i].z);
+		if(a > maxP) maxP = a;
+		if(b > maxP) maxP = b;
+		if(c > maxP) maxP = c;
+	}
+	if(uv)
+		for(int32 i = 0; i < n; i++){
+			float a = fabsf(uv[i].u), b = fabsf(uv[i].v);
+			if(a > maxT) maxT = a;
+			if(b > maxT) maxT = b;
+		}
+	int ps = gxShiftFor(maxP, 3);
+	int ts = uv ? gxShiftFor(maxT, 9) : -1;
+	if(ps < 0) gxPackRefusedPos++;
+	if(uv && ts < 0) gxPackRefusedUV++;
+	if(ps < 0 && ts < 0)
+		return;
+
+	size_t posSz = ps >= 0 ? (size_t)n*3*sizeof(int16) : 0;
+	size_t uvSz  = ts >= 0 ? (size_t)n*2*sizeof(int16) : 0;
+	uint8 *blk = (uint8*)rwMalloc(posSz + uvSz, MEMDUR_EVENT | ID_GEOMETRY);
+	if(blk == nil)
+		return;              // non-must: staying on the float path is correct
+	g->packBase = blk;
+
+	if(ps >= 0){
+		int16 *p = (int16*)blk;
+		g->pos = p;
+		g->posShift = (uint8)ps;
+		for(int32 i = 0; i < n; i++){
+			*p++ = gxQuant(verts[i].x, ps);
+			*p++ = gxQuant(verts[i].y, ps);
+			*p++ = gxQuant(verts[i].z, ps);
+		}
+		g->packed |= GXPACK_POS;
+	}
+	if(ts >= 0){
+		int16 *t = (int16*)(blk + posSz);
+		g->uv = t;
+		g->uvShift = (uint8)ts;
+		for(int32 i = 0; i < n; i++){
+			*t++ = gxQuant(uv[i].u, ts);
+			*t++ = gxQuant(uv[i].v, ts);
+		}
+		g->packed |= GXPACK_UV;
+	}
+
+	// Release what we just replaced. Shrinking reallocs only: the block can
+	// never end up larger than it started, so this eases fragmentation rather
+	// than adding to it — the same reasoning dropTrianglesAfterInstancing uses.
+	if(g->packed & GXPACK_POS){
+		size_t keep = sizeof(MorphTarget);
+		size_t vertSz = (size_t)n*sizeof(V3d);
+		if(mt->normals){
+			memmove(mbase + keep, mbase + keep + vertSz, vertSz);
+			keep += vertSz;
+		}
+		gxPackSaved += (uint32)vertSz;
+		uint8 *shrunk = (uint8*)rwRealloc(mbase, keep, MEMDUR_EVENT | ID_GEOMETRY);
+		if(shrunk)
+			mbase = shrunk;
+		geo->morphTargets = (MorphTarget*)mbase;
+		mt = &geo->morphTargets[0];
+		mt->vertices = nil;
+		mt->normals = mt->normals ? (V3d*)(mbase + sizeof(MorphTarget)) : nil;
+	}
+	if(g->packed & GXPACK_UV){
+		gxPackSaved += (uint32)((size_t)n*sizeof(TexCoords));
+		uint8 *shrunk = (uint8*)rwRealloc(abase, colSz ? colSz : 1,
+		                                  MEMDUR_EVENT | ID_GEOMETRY);
+		if(shrunk)
+			abase = shrunk;
+		geo->attribBase = abase;
+		if(colSz)
+			geo->colors = (RGBA*)abase;
+		// Say it out loud rather than leaving a dangling array that still
+		// looks valid to anything that reads it later.
+		geo->texCoords[0] = nil;
+	}
+	gxPackGeoms++;
 }
 
 static void*
@@ -691,6 +886,7 @@ gxNativeFail(const char *why, uint32 a, uint32 b)
 		return;
 	char line[128];
 	snprintf(line, sizeof(line), "NATIVE fail %s a=%u b=%u", why, a, b);
+	DVD_FS_GUARD;
 	FILE *f = fopen("dvd:/native.log", "a");
 	if(f){ fprintf(f, "%s\n", line); fclose(f); }
 }

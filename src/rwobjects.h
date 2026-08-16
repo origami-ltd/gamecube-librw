@@ -525,6 +525,10 @@ struct Geometry
 	Triangle *triangles;
 	RGBA *colors;
 	TexCoords *texCoords[8];
+	// Base of the single block holding triangles + colors + texCoords. It used
+	// to be implicit (== triangles), which is why the triangle array could never
+	// be released on its own. Freed by destroy() instead of `triangles`.
+	uint8 *attribBase;
 
 	MorphTarget *morphTargets;
 	MaterialList matList;
@@ -548,6 +552,7 @@ struct Geometry
 	MeshHeader *allocateMeshes(int32 numMeshes, uint32 numIndices, bool32 noIndices);
 	void generateTriangles(int8 *adc = nil);
 	void buildMeshes(void);
+	void dropTrianglesAfterInstancing(void);
 	void buildTristrips(void);	// private, used by buildMeshes
 	void correctTristripWinding(void);
 	void removeUnusedMaterials(void);

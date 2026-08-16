@@ -79,6 +79,7 @@ Geometry::create(int32 numVerts, int32 numTris, uint32 flags)
 			numAllocated--;
 			return nil;
 		}
+		geo->attribBase = data;
 		geo->triangles = (Triangle*)data;
 		data += geo->numTriangles*sizeof(Triangle);
 		if(geo->flags & PRELIT && geo->numVertices){
@@ -100,7 +101,7 @@ Geometry::create(int32 numVerts, int32 numTris, uint32 flags)
 	geo->addMorphTargets(1);
 	if(geo->morphTargets == nil){
 		// out of memory above; every caller already handles a nil geometry
-		rwFree(geo->triangles); // the combined attribute block, or nil
+		rwFree(geo->attribBase); // the combined attribute block, or nil
 		rwFree(geo);
 		numAllocated--;
 		return nil;
@@ -123,7 +124,7 @@ Geometry::destroy(void)
 	if(this->refCount <= 0){
 		s_plglist.destruct(this);
 		// Also frees colors and tex coords
-		rwFree(this->triangles);
+		rwFree(this->attribBase);
 		// Also frees their data
 		rwFree(this->morphTargets);
 		// Also frees indices
@@ -221,8 +222,15 @@ Geometry::streamRead(Stream *stream)
 		defaultSurfaceProps = reset;
 	if(ret == nil)
 		goto fail;
-	if(s_plglist.streamRead(stream, geo))
+	if(s_plglist.streamRead(stream, geo)){
+#ifdef RW_GAMECUBE
+		// The BIN MESH plugin has just supplied meshHeader, so the triangle
+		// array is redundant from here on. This is the one place a streamed
+		// geometry is finished.
+		geo->dropTrianglesAfterInstancing();
+#endif
 		return geo;
+	}
 
 fail:
 	geo->destroy();
@@ -410,6 +418,63 @@ Geometry::hasColoredMaterial(void)
 	return 0;
 }
 
+// Hand back the triangle array once the mesh header exists.
+//
+// librw stores the same connectivity twice: Triangle triangles[numTriangles] at
+// 8 bytes each, and — after the BIN MESH plugin or buildMeshes — the per-mesh
+// uint16 index lists. The GX backend draws only from the mesh indices; nothing
+// reads triangles[] again. A census of every DFF in gta3.img put the duplicate
+// at 16.9MB of the 87.2MB the RW arrays occupy: 19% of all geometry, resident
+// for as long as the model is.
+//
+// This reduces the REAL bytes a loaded model costs, so more world fits inside
+// the same budget at the same reserve. That is the opposite trade from cutting
+// the reserve, which buys budget by spending the headroom the exterior needs.
+//
+// Cleared by A/B against the outdoor render: with this disabled the exterior
+// looked identical, so it is not implicated in that regression.
+void
+Geometry::dropTrianglesAfterInstancing(void)
+{
+	if(this->attribBase == nil || this->numTriangles == 0 ||
+	   this->meshHeader == nil || (this->flags & NATIVE))
+		return;
+	// Only the layout create() builds; anything else is left alone.
+	if((uint8*)this->triangles != this->attribBase)
+		return;
+	size_t triSz = (size_t)this->numTriangles*sizeof(Triangle);
+	size_t rest = 0;
+	if(this->flags & PRELIT && this->numVertices)
+		rest += (size_t)this->numVertices*sizeof(RGBA);
+	if(this->numVertices)
+		rest += (size_t)this->numTexCoordSets*this->numVertices*sizeof(TexCoords);
+
+	uint8 *base = this->attribBase;
+	if(rest)
+		memmove(base, base + triSz, rest);
+	// Shrinking realloc: it cannot leave us worse off than we started, and the
+	// block gets smaller, so this eases fragmentation rather than adding to it.
+	uint8 *shrunk = (uint8*)rwRealloc(base, rest ? rest : 1,
+	                                  MEMDUR_EVENT | ID_GEOMETRY);
+	if(shrunk)
+		base = shrunk;
+	this->attribBase = base;
+	uint8 *p = base;
+	if(this->flags & PRELIT && this->numVertices){
+		this->colors = (RGBA*)p;
+		p += (size_t)this->numVertices*sizeof(RGBA);
+	}
+	if(this->numVertices)
+		for(int32 i = 0; i < this->numTexCoordSets; i++){
+			this->texCoords[i] = (TexCoords*)p;
+			p += (size_t)this->numVertices*sizeof(TexCoords);
+		}
+	// Say it out loud rather than leaving a dangling array that still looks
+	// valid to anything that reads it later.
+	this->triangles = nil;
+	this->numTriangles = 0;
+}
+
 // Force allocate data, even when native flag is set
 void
 Geometry::allocateData(void)
@@ -422,6 +487,7 @@ Geometry::allocateData(void)
 	sz += this->numTexCoordSets*this->numVertices*sizeof(TexCoords);
 
 	uint8 *data = (uint8*)rwNew(sz, MEMDUR_EVENT | ID_GEOMETRY);
+	this->attribBase = data;
 	this->triangles = (Triangle*)data;
 	data += this->numTriangles*sizeof(Triangle);
 	for(int32 i = 0; i < this->numTriangles; i++)

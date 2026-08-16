@@ -70,7 +70,22 @@ struct GxGeoExt
 	void **lists;
 	uint32 *sizes;
 	int32 numLists;
+	// Quantised attributes, and the float arrays they replaced are freed.
+	// One block for both so a geometry costs one allocation, not two: the
+	// arena here fragments badly enough that the combined attribute block in
+	// Geometry::create is already a documented failure point.
+	void *packBase;
+	int16 *pos;               // 3 per vertex, stored value = float<<posShift
+	int16 *uv;                // 2 per vertex, stored value = float<<uvShift
+	uint8 posShift, uvShift;
+	uint8 packed;             // GXPACK_* bits
 };
+enum { GXPACK_POS = 1, GXPACK_UV = 2, GXPACK_TRIED = 4 };
+// Quantise a streamed geometry in place. Call once, after the DFF has loaded
+// and before it is first drawn.
+void gxPackGeometry(Geometry *geo);
+extern uint32 gxPackSaved;    // running total of bytes reclaimed
+extern uint32 gxPackGeoms, gxPackRefusedPos, gxPackRefusedUV;
 extern int32 gxGeoOffset;
 extern uint32 gxDlBytes;
 

@@ -20,11 +20,38 @@
 
 #include <gccore.h>
 #include <malloc.h>
+
+// libfat is shared with the game's streaming worker and must be serialised;
+// the lock lives in CdStream_gamecube.cpp. Declared rather than included
+// because librw does not get to see the game's headers.
+extern "C" {
+void CdStreamFsLock(void);
+void CdStreamFsUnlock(void);
+}
+namespace { struct DvdFsGuard {
+	DvdFsGuard(void) { CdStreamFsLock(); }
+	~DvdFsGuard(void) { CdStreamFsUnlock(); }
+}; }
+#define DVD_FS_CAT2(a, b) a##b
+#define DVD_FS_CAT(a, b) DVD_FS_CAT2(a, b)
+#define DVD_FS_GUARD DvdFsGuard DVD_FS_CAT(_dvdFsGuard_, __LINE__)
+
 #include <ogc/lwp_watchdog.h>
 
 void GeckoLog(const char*); // game-side USB Gecko logger (gamecube.cpp)
 extern unsigned gxCopyUs;   // defined below at global scope
 extern unsigned gxShowUs;   // whole showRaster duration
+// What the VI actually came up in, latched at startGX and reported by the
+// heartbeat — see startGX for why it cannot just be printed there.
+unsigned gxViTVMode, gxHaveComponent, gxXfbHeight, gxEfbHeight;
+// Whether showRaster waits for the retrace. The game pushes m_PrefsVsync down
+// into this; defaults on so a build that never sets it behaves as before.
+unsigned gxWaitRetrace = 1;
+// Camera raster size latched at present time — the real render target.
+unsigned gxCamW, gxCamH;
+// Which submitter last handed work to the GP. Read by the freeze watchdog in
+// the game skel, which cannot see librw's statics.
+const char *gxLastPath = "-";
 // per-frame draw counters, read by the HUD overlay
 unsigned gxMeshCount, gxVertCount, gxDlMeshCount;
 unsigned gxSimUs, gxRenderUs, gxStreamUs;
@@ -43,6 +70,7 @@ namespace gx {
 // the cache costs 2MB out of a 15MB arena — which is what pushed streaming
 // back into mustmalloc/exit(1). Raise this only on hardware, where freeing
 // the CPU actually matters and memory has been re-budgeted for it.
+#define GX_FORCE_PROGRESSIVE 1 // 480p even when the cable check says no; see startGX
 #define GX_DL_BUDGET 0
 #define GX_USE_INDEXED 0 // regression bisect: 1 = GP DMA vertex arrays
 // debug: dump every input to the skinned (ped) draw over USB Gecko, bounded
@@ -90,6 +118,39 @@ startGX(void)
 
 	VIDEO_Init();
 	rmode = VIDEO_GetPreferredMode(nil);
+
+	// 480p. VIDEO_GetPreferredMode hands back a progressive mode only when the
+	// console's own setting already asks for one, and for a port whose whole
+	// point is 60fps that setting is not optional: interlaced scans out 240
+	// lines per field, so half the image on screen is always one field stale.
+	// PAL50 is left alone — 576p is a different resolution, not a flag.
+	//
+	// GX_FORCE_PROGRESSIVE exists because VIDEO_HaveComponentCable() alone is
+	// not a usable gate here. Measured: Dolphin reports cbl=0 regardless of its
+	// progressive-scan setting (the SYSCONF byte is rewritten back to 0 on
+	// launch, and the ProgressiveScan override is a per-game INI key that a
+	// loose .dol has no game ID to match), so on the emulator the cable check
+	// can never pass and the port can never be seen in 480p.
+	//
+	// Forcing is safe there — an emulator has no composite cable to be
+	// incompatible with — and on real hardware component cables and the GCVideo
+	// / GCHD digital adapters all set the DTV bit, so the forced path matches
+	// what the check would have allowed anyway. Set this to 0 for a console
+	// wired over composite, where progressive output is no picture at all.
+	if(GX_FORCE_PROGRESSIVE || VIDEO_HaveComponentCable())
+		switch(rmode->viTVMode >> 2){
+		case VI_NTSC:    rmode = &TVNtsc480Prog; break;
+		case VI_EURGB60: rmode = &TVEurgb60Hz480Prog; break;
+		}
+
+	// Reported by the heartbeat rather than printed here: this runs before the
+	// SD is mounted and before Dolphin's Gecko listener attaches, so a printf
+	// at this point goes nowhere and reads as "no output" instead of "not seen".
+	// viTVMode&3: 0 interlaced, 1 double-strike, 2 progressive.
+	::gxViTVMode = rmode->viTVMode;
+	::gxHaveComponent = VIDEO_HaveComponentCable();
+	::gxXfbHeight = rmode->xfbHeight;
+	::gxEfbHeight = rmode->efbHeight;
 
 	xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
@@ -354,6 +415,52 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 	}
 }
 
+// Last state handed to the GP, so a stall can name what it choked on rather
+// than leaving a frozen screen and nothing else. Updated once per draw call,
+// which is a handful of stores — not per vertex.
+struct GxLastDraw {
+	const char *path;
+	const char *texName;
+	Raster *texRaster;
+	uint32 count;
+	uint16 texW, texH;
+	uint8 hasTex, prim, vtxfmt, posFrac, uvFrac;
+};
+static GxLastDraw gxLast;
+
+static void
+gxReportGpStall(void)
+{
+	// Bounded: a stall normally repeats on every frame after the first, and a
+	// log that fills the SD helps nobody.
+	static int left = 8;
+	if(left-- <= 0)
+		return;
+	char line[256];
+	snprintf(line, sizeof(line),
+	    "GPSTALL path=%s tex=%s raster=%p %ux%u has=%d prim=%d fmt=%d "
+	    "count=%u posFrac=%d uvFrac=%d",
+	    gxLast.path ? gxLast.path : "-",
+	    gxLast.texName ? gxLast.texName : "-",
+	    (void*)gxLast.texRaster, (unsigned)gxLast.texW, (unsigned)gxLast.texH,
+	    (int)gxLast.hasTex, (int)gxLast.prim, (int)gxLast.vtxfmt,
+	    (unsigned)gxLast.count, (int)gxLast.posFrac, (int)gxLast.uvFrac);
+	// Gecko truncates past a couple of dozen characters, so the transport
+	// that carries the detail is the SD; the Gecko line is only the flag that
+	// tells you to go read it.
+	GeckoLog("GPSTALL");
+	DVD_FS_GUARD;
+	FILE *f = fopen("dvd:/gpstall.log", "a");
+	if(f){
+		fprintf(f, "%s\n", line);
+		fclose(f);
+	}
+	// Best effort: drop whatever the GP is chewing on so the next frame has a
+	// chance. If it stalls again the log says so, which is still progress on a
+	// freeze that previously produced no evidence at all.
+	GX_AbortFrame();
+}
+
 static void
 showRaster(Raster *raster, uint32 flags)
 {
@@ -367,6 +474,14 @@ showRaster(Raster *raster, uint32 flags)
 		unsigned long long t;
 		~ShowTimer(){ ::gxShowUs = (unsigned)ticks_to_microsecs(gettime() - t); }
 	} showTimer = { tShow };
+	// The camera raster IS the render target, so its size is the answer to
+	// "what resolution is the game actually drawing" — measured, rather than
+	// inferred from the video mode, which is 640x480 and says nothing about
+	// what the game asked the camera for.
+	if(raster){
+		::gxCamW = raster->width;
+		::gxCamH = raster->height;
+	}
 	startGX();
 
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
@@ -386,9 +501,32 @@ showRaster(Raster *raster, uint32 flags)
 	// DrawDone AFTER queuing the copy (the libogc order). Calling it
 	// first made the CPU wait for the GP to drain, then queue the copy,
 	// then wait again — a whole extra round trip per frame.
+	//
+	// Bounded, though, because GX_DrawDone() waits on the GP with no way out
+	// and a stalled GP is a real failure mode here: a vertex descriptor that
+	// disagrees with the data pushed, or a TEV stage sampling a texmap that
+	// was never loaded, both park the GP forever. From outside it is
+	// indistinguishable from a hang anywhere else in the game — frozen image,
+	// no exception, no crash.log, and near-zero CPU because the thread is
+	// blocked rather than spinning. That is exactly how the pause-menu freeze
+	// presented, and with an unbounded wait there is nothing to read
+	// afterwards. A draw-sync token gives the same ordering guarantee and can
+	// be polled against a deadline, so the GP tells on itself instead.
 	{
 		unsigned long long t0 = gettime();
-		GX_DrawDone();
+		static u16 syncToken;
+		if(++syncToken == 0)
+			syncToken = 1;
+		GX_SetDrawSync(syncToken);
+		GX_Flush();
+		// Far beyond any real frame: the heaviest measured GP time is single
+		// -digit milliseconds, so this only fires on a genuine stall.
+		unsigned long long deadline = t0 + millisecs_to_ticks(500);
+		while(GX_GetDrawSync() != syncToken)
+			if(gettime() > deadline){
+				gxReportGpStall();
+				break;
+			}
 		gxGpUs = (unsigned)ticks_to_microsecs(gettime() - t0);
 	}
 	GX_Flush();
@@ -401,7 +539,16 @@ showRaster(Raster *raster, uint32 flags)
 	// simulation at ~10ms and scene submission at ~1ms, so the lock was
 	// the frame rate: any frame a hair over 33ms fell to the next pair
 	// and presented at 66ms, which is the 17-20fps beat we measured.
-	VIDEO_WaitVSync();
+	//
+	// Optional now, driven by m_PrefsVsync through gxWaitRetrace (the game
+	// pushes it down; librw has no business knowing about the menu manager).
+	// Waiting here quantises the frame to a whole retrace, so a 20ms frame
+	// presents at 33.3ms and reads as 30fps — true to what a TV shows, but it
+	// hides how far over budget the frame actually is. With the wait off and
+	// the skel's frame limiter pacing instead, that same frame reads 50fps,
+	// which is the number you want when deciding what to optimise.
+	if(::gxWaitRetrace)
+		VIDEO_WaitVSync();
 	gxVsyncUs = (unsigned)ticks_to_microsecs(gettime() - tv);
 }
 
@@ -615,6 +762,18 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 	setupIm2DVtxDesc(tex != nil);
 	setIm2DMatrices();
 
+	gxLastPath = "2d";
+	gxLast.path = "2d";
+	gxLast.texName = nil;
+	gxLast.texRaster = currentTexRaster;
+	gxLast.texW = currentTexRaster ? currentTexRaster->width : 0;
+	gxLast.texH = currentTexRaster ? currentTexRaster->height : 0;
+	gxLast.hasTex = tex != nil;
+	gxLast.prim = prim;
+	gxLast.vtxfmt = 0;
+	gxLast.count = count;
+	gxLast.posFrac = gxLast.uvFrac = 0xFF;
+
 	GX_Begin(prim, GX_VTXFMT0, count);
 	for(int32 i = 0; i < count; i++){
 		Im2DVertex *v = &verts[indices ? idx[i] : i];
@@ -671,11 +830,31 @@ static bool32 gx3DMemoDirty = 1;
 static void gx3DMemoInvalidate(void) { gx3DMemoDirty = 1; }
 static void gx2DMemoInvalidate(void);
 
+static inline int
+clamp255i(int v)
+{
+	return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+// (a*b)/255 for a,b in 0..255, exact, without a divide.
+static inline int
+mul255(int a, int b)
+{
+	int t = a*b + 128;
+	return (t + (t >> 8)) >> 8;
+}
+
 static void
 setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	RGBA matcol, float surfAmb, const RGBAf *ambLight, u8 lightMask,
-	bool32 sendColor, bool32 indexed = 0, RGBA ambAdd = {0,0,0,0})
+	bool32 sendColor, bool32 indexed = 0, RGBA ambAdd = {0,0,0,0},
+	u8 posFrac = 0xFF, u8 uvFrac = 0xFF)
 {
+	// posFrac/uvFrac: 0xFF means the attribute is float32, anything else is the
+	// binary shift of a gxPackGeometry-quantised int16 array. The shift is part
+	// of the vertex format, so it MUST be part of the memo key — two geometries
+	// with different extents pick different shifts, and reusing the previous
+	// format would scale one of them by the other's factor.
 	// Memo: VC submits long runs of meshes with identical setup. Each call
 	// is ~30 GP register writes + a projection reload; skipping the repeats
 	// is the cheapest real win in the immediate-mode path.
@@ -689,10 +868,12 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	static RGBA mAmbAdd;
 	static bool32 mTexOpaque;
 	static bool32 mSend;
+	static u8 mPosFrac = 0xFF, mUvFrac = 0xFF;
 	RGBAf ambl = ambLight ? *ambLight : (RGBAf){0,0,0,0};
 	if(!gx3DMemoDirty && mT == textured && mL == lit && mP == prelit &&
 	   mN == haveNormals && mMask == lightMask && mAmb == surfAmb &&
 	   mIdx == indexed && mTexOpaque == stTexOpaque && mSend == sendColor &&
+	   mPosFrac == posFrac && mUvFrac == uvFrac &&
 	   *(uint32*)&mAmbAdd == *(uint32*)&ambAdd &&
 	   *(uint32*)&mMat == *(uint32*)&matcol &&
 	   mAmbL.red == ambl.red && mAmbL.green == ambl.green &&
@@ -709,11 +890,15 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	mMask = lightMask; mAmb = surfAmb; mMat = matcol; mAmbL = ambl;
 	mIdx = indexed; mAmbAdd = ambAdd; mTexOpaque = stTexOpaque;
 	mSend = sendColor;
+	mPosFrac = posFrac; mUvFrac = uvFrac;
 
 	u8 attrMode = indexed ? GX_INDEX16 : GX_DIRECT;
 	GX_ClearVtxDesc();
 	GX_SetVtxDesc(GX_VA_POS, attrMode);
-	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	if(posFrac == 0xFF)
+		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	else
+		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_S16, posFrac);
 	bool32 hwLights = lit && haveNormals && lightMask != GX_LIGHTNULL;
 	if(hwLights){
 		GX_SetVtxDesc(GX_VA_NRM, attrMode);
@@ -781,7 +966,10 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 
 	if(textured){
 		GX_SetVtxDesc(GX_VA_TEX0, attrMode);
-		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+		if(uvFrac == 0xFF)
+			GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+		else
+			GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_S16, uvFrac);
 		GX_SetNumTexGens(1);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 	}else
@@ -959,8 +1147,17 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	   !gxStarted || !gxHaveCamera)
 		return;
 
+	// gxPackGeometry replaces the float positions and texcoords of streamed
+	// world geometry with int16 arrays and frees the originals, so either side
+	// can legitimately be nil — but not both.
+	GxGeoExt *gpk = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
+	const int16 *packPos = (gpk->packed & GXPACK_POS) ? gpk->pos : nil;
+	const int16 *packUV = (gpk->packed & GXPACK_UV) ? gpk->uv : nil;
+	u8 posFrac = packPos ? gpk->posShift : 0xFF;
+	u8 uvFrac = packUV ? gpk->uvShift : 0xFF;
+
 	V3d *verts = geo->morphTargets[0].vertices;
-	if(verts == nil)
+	if(verts == nil && packPos == nil)
 		return;
 	TexCoords *uv = geo->numTexCoordSets > 0 ? geo->texCoords[0] : nil;
 	RGBA *prelit = (geo->flags & Geometry::PRELIT) ? geo->colors : nil;
@@ -1125,9 +1322,15 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	// frame for nothing (measured: 19fps -> 8fps).
 	if(skinnedAtomic)
 		GX_InvVtxCache();
-	GX_SetArray(GX_VA_POS, verts, sizeof(V3d));
-	if(needFlush || skinnedAtomic)
-		DCFlushRange(verts, geo->numVertices*sizeof(V3d));
+	if(packPos){
+		GX_SetArray(GX_VA_POS, (void*)packPos, 3*sizeof(int16));
+		if(needFlush)
+			DCFlushRange((void*)packPos, geo->numVertices*3*sizeof(int16));
+	}else{
+		GX_SetArray(GX_VA_POS, verts, sizeof(V3d));
+		if(needFlush || skinnedAtomic)
+			DCFlushRange(verts, geo->numVertices*sizeof(V3d));
+	}
 	if(normals){
 		GX_SetArray(GX_VA_NRM, normals, sizeof(V3d));
 		if(needFlush)
@@ -1138,7 +1341,11 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		if(needFlush)
 			DCFlushRange(prelit, geo->numVertices*sizeof(RGBA));
 	}
-	if(uv){
+	if(packUV){
+		GX_SetArray(GX_VA_TEX0, (void*)packUV, 2*sizeof(int16));
+		if(needFlush)
+			DCFlushRange((void*)packUV, geo->numVertices*2*sizeof(int16));
+	}else if(uv){
 		GX_SetArray(GX_VA_TEX0, uv, sizeof(TexCoords));
 		if(needFlush)
 			DCFlushRange(uv, geo->numVertices*sizeof(TexCoords));
@@ -1174,7 +1381,12 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// (0x11/0x13, i.e. no tex coord sets), which is what rendered
 		// characters as flat black silhouettes while their textured meshes
 		// (jeans, forearms) came out fine.
-		GXTexObj *tex = (texture && uv) ? gxGetTexture(texture->raster) : nil;
+		// "Has texture coordinates" is the real condition, and after
+		// gxPackGeometry they may live in the packed int16 array instead of
+		// the float one. Testing only `uv` here drew every packed world
+		// geometry untextured — a white city with correct silhouettes.
+		GXTexObj *tex = (texture && (uv || packUV)) ?
+		    gxGetTexture(texture->raster) : nil;
 #if GX_UV_DEBUG
 		tex = nil;  // show the raw UV colour, unmodulated by any texel
 #endif
@@ -1245,6 +1457,12 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		}
 		float matR = matcol.red/255.0f, matG = matcol.green/255.0f;
 		float matB = matcol.blue/255.0f, matA = matcol.alpha/255.0f;
+		// 8-bit forms of the same per-mesh terms, for the integer vertex
+		// colour path below. Every input is already 8-bit; only the
+		// arithmetic was float.
+		int ambR8 = clamp255i((int)(ambR*255.0f + 0.5f));
+		int ambG8 = clamp255i((int)(ambG*255.0f + 0.5f));
+		int ambB8 = clamp255i((int)(ambB*255.0f + 0.5f));
 #if GX_PROBE_SKIN
 		// Peds are the only geometry that reaches the GX hardware-lighting
 		// path: world geometry has no normals, so it takes the CPU ambient
@@ -1300,6 +1518,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 			// capture is cut mid-string), which would silently shred exactly
 			// the fields being probed. libfat only commits on fclose, so
 			// open/append/close per line — bounded, so the cost is bounded.
+			DVD_FS_GUARD;
 			FILE *f = fopen("dvd:/skin.log", "a");
 			if(f){
 				fprintf(f, "%s\n", line);
@@ -1314,7 +1533,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// run, which is what lets the memo skip the ~30 register writes.
 		setup3DDraw(tex != nil, 0, 1, 0,
 		    makeRGBA(255, 255, 255, 255), 1.0f, nil, GX_LIGHTNULL,
-		    sendColor, useIdx, ambK);
+		    sendColor, useIdx, ambK, posFrac, uvFrac);
 		if(skinnedAtomic){
 			// Character rigs mirror their left-side bones, so those bone
 			// matrices carry a negative determinant and flip the winding
@@ -1380,6 +1599,19 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 			}
 		}
 
+		gxLastPath = skinnedAtomic ? "3d-skin" : "3d";
+		gxLast.path = skinnedAtomic ? "3d-skin" : "3d";
+		gxLast.texName = texture ? texture->name : nil;
+		gxLast.texRaster = texture ? texture->raster : nil;
+		gxLast.texW = texture && texture->raster ? texture->raster->width : 0;
+		gxLast.texH = texture && texture->raster ? texture->raster->height : 0;
+		gxLast.hasTex = tex != nil;
+		gxLast.prim = prim;
+		gxLast.vtxfmt = 1;
+		gxLast.count = total;
+		gxLast.posFrac = posFrac;
+		gxLast.uvFrac = uvFrac;
+
 		uint32 start = 0;
 		while(start < total){
 			uint32 count = total - start;
@@ -1406,7 +1638,13 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 			}
 			for(uint32 i = start; i < start + count; i++){
 				uint16 vi = mesh->indices[i];
-				GX_Position3f32(verts[vi].x, verts[vi].y, verts[vi].z);
+				// Half the position bytes through the write-gather pipe, and
+				// the GP applies posFrac itself — no unpacking here.
+				if(packPos){
+					const int16 *p = packPos + 3*vi;
+					GX_Position3s16(p[0], p[1], p[2]);
+				}else
+					GX_Position3f32(verts[vi].x, verts[vi].y, verts[vi].z);
 				// MUST be hwLights, not lit2: the descriptor only declares
 				// NRM when hardware lighting is actually on. A lit mesh with
 				// normals but zero enumerated directionals (night, or a
@@ -1416,6 +1654,40 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 					GX_Normal3f32(normals[vi].x, normals[vi].y,
 					    normals[vi].z);
 				{
+#if !GX_WIREFRAME && !GX_UV_DEBUG
+				// With no directional contributing, the whole expression is
+				// clamp(prelight + ambient) * material, and every term in it
+				// is already 8-bit — only the arithmetic was float. That
+				// matters more here than it looks: Gekko has no direct path
+				// between the float and integer registers, so each (u8)(float)
+				// is a store and a reload through memory, and the float
+				// version pays eight of them per vertex. World geometry has no
+				// normals, so this is the path essentially the whole city
+				// takes. Measured as the difference between work17 (a missed
+				// retrace, 30fps) and fitting inside 16.6ms again.
+				if(numDir == 0){
+					int r8 = ambR8, g8 = ambG8, b8 = ambB8, a8 = 255;
+					if(prelitMesh){
+						r8 += prelit[vi].red;
+						g8 += prelit[vi].green;
+						b8 += prelit[vi].blue;
+						a8 = prelit[vi].alpha;
+					}
+					GX_Color4u8(
+					    (u8)mul255(clamp255i(r8), matcol.red),
+					    (u8)mul255(clamp255i(g8), matcol.green),
+					    (u8)mul255(clamp255i(b8), matcol.blue),
+					    (u8)mul255(a8, matcol.alpha));
+					if(tex){
+						if(packUV)
+							GX_TexCoord2s16(packUV[2*vi], packUV[2*vi+1]);
+						else
+							GX_TexCoord2f32(uv ? uv[vi].u : 0.0f,
+							    uv ? uv[vi].v : 0.0f);
+					}
+					continue;
+				}
+#endif
 					// librw gl3 default.vert, evaluated on the CPU:
 					//   c  = prelight            (else (0,0,0,1))
 					//   c += amb*surfAmbient
@@ -1470,9 +1742,13 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 					    (u8)(b*matB*255.0f), (u8)(a*matA*255.0f));
 #endif
 				}
-				if(tex)
-					GX_TexCoord2f32(uv ? uv[vi].u : 0.0f,
-					    uv ? uv[vi].v : 0.0f);
+				if(tex){
+					if(packUV)
+						GX_TexCoord2s16(packUV[2*vi], packUV[2*vi+1]);
+					else
+						GX_TexCoord2f32(uv ? uv[vi].u : 0.0f,
+						    uv ? uv[vi].v : 0.0f);
+				}
 			}
 			GX_End();
 			if(start + count >= total)
