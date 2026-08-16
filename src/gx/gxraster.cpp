@@ -126,6 +126,7 @@ destroyGeoExt(void *object, int32 offset, int32)
 	free(g->lists);
 	free(g->sizes);
 	rwFree(g->packBase);
+	rwFree(g->colors);
 	memset(g, 0, sizeof(*g));
 	return object;
 }

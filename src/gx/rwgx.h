@@ -79,6 +79,20 @@ struct GxGeoExt
 	int16 *uv;                // 2 per vertex, stored value = float<<uvShift
 	uint8 posShift, uvShift;
 	uint8 packed;             // GXPACK_* bits
+	// Vertex colours, precomputed so the indexed path can exist at all.
+	//
+	// The immediate path computes clamp(prelight + ambient) * material per
+	// vertex per frame, and because that result lives nowhere there is no
+	// array to index — which is why GX_USE_INDEXED was switched off. But for
+	// static world geometry every input except prelight is constant per mesh,
+	// so the answer only changes when the ambient or the material does, i.e.
+	// with the time of day. Cache it and all three attributes become arrays:
+	// the CPU pushes indices and the GP DMAs the data itself.
+	//
+	// Costs 4 bytes a vertex against the 10 gxPackGeometry freed.
+	RGBA  *colors;
+	uint32 colorKey;          // ambient and material this was built for
+	int32  colorCount;
 };
 enum { GXPACK_POS = 1, GXPACK_UV = 2, GXPACK_TRIED = 4 };
 // Quantise a streamed geometry in place. Call once, after the DFF has loaded

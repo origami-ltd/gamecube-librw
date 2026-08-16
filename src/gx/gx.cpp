@@ -1183,6 +1183,53 @@ im3DEnd(void)
 //   color = (prelight + amb*surfAmb + dir*surfDiff*max(0,N.-L)) * matColor
 // ponytail: CPU-fed vertices every frame; the upgrade path is cached GX
 // display lists per mesh when this becomes the bottleneck.
+// Precompute clamp(prelight + ambient) * material for a whole geometry.
+//
+// This is the array the indexed path needs and never had: the immediate path
+// computes the same expression per vertex per frame and throws it away, so
+// there was nothing to index. Every input except prelight is constant per
+// mesh, so the result only changes when the ambient or the material does —
+// with the time of day, not with the frame.
+//
+// Returns false when the geometry is not a candidate (skinned, lit by
+// directionals, or no prelight), in which case the caller stays immediate.
+static bool32
+gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
+	int ambR8, int ambG8, int ambB8, RGBA matcol)
+{
+	if(prelit == nil || numDir != 0)
+		return 0;
+	int32 n = geo->numVertices;
+	if(n <= 0)
+		return 0;
+
+	// One key covering everything that is not per-vertex. A mismatch rebuilds;
+	// a match is free.
+	uint32 key = (uint32)ambR8 | ((uint32)ambG8<<8) | ((uint32)ambB8<<16) ^
+	    (*(uint32*)&matcol * 2654435761u);
+	if(g->colors && g->colorCount == n && g->colorKey == key)
+		return 1;
+
+	if(g->colors == nil || g->colorCount != n){
+		rwFree(g->colors);
+		g->colors = (RGBA*)rwMalloc(n*sizeof(RGBA), MEMDUR_EVENT | ID_GEOMETRY);
+		if(g->colors == nil){ g->colorCount = 0; return 0; }
+		g->colorCount = n;
+	}
+	for(int32 i = 0; i < n; i++){
+		int r8 = clamp255i(ambR8 + prelit[i].red);
+		int g8 = clamp255i(ambG8 + prelit[i].green);
+		int b8 = clamp255i(ambB8 + prelit[i].blue);
+		g->colors[i].red   = (uint8)mul255(r8, matcol.red);
+		g->colors[i].green = (uint8)mul255(g8, matcol.green);
+		g->colors[i].blue  = (uint8)mul255(b8, matcol.blue);
+		g->colors[i].alpha = (uint8)mul255(prelit[i].alpha, matcol.alpha);
+	}
+	g->colorKey = key;
+	DCFlushRange(g->colors, n*sizeof(RGBA));
+	return 1;
+}
+
 static void
 atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 {
@@ -1490,8 +1537,16 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// to index one out of, so the indexed path cannot apply here at all.
 		// The TEV ambient konst is gone with it — ambient is in the vertex
 		// color now, where gl3 puts it.
+		// Indexed when the vertex colours can come from an array instead of
+		// being recomputed per vertex. gxBuildColorCache below makes that
+		// array for static, unskinned, unlit geometry — which is the city.
+		// Behind GX_USE_INDEXED until it has been measured against the
+		// immediate path on real scenes; the profiler's gp column is what
+		// decides whether moving work to the GP helps or just moves the
+		// bottleneck.
 		bool32 useIdx = 0;
 		RGBA ambK = { 0, 0, 0, 0 };
+		(void)ambK;
 
 		// Per-material light terms, precomputed once per mesh (gl3 scales the
 		// ambient by surfAmbient and each directional by surfDiffuse).
@@ -1577,9 +1632,25 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// color above, so none of them reach the GP any more. Passing white
 		// and no lights keeps the setup identical across every material in a
 		// run, which is what lets the memo skip the ~30 register writes.
+#if GX_USE_INDEXED
+		// All three attributes have to be arrays for this to be legal: packed
+		// positions and texcoords from gxPackGeometry, colours from the cache.
+		// Any one missing and the vertex stream would disagree with the
+		// descriptor, which desyncs the FIFO rather than drawing wrong.
+		if(!skinnedAtomic && packPos && (tex == nil || packUV) &&
+		   gxBuildColorCache(geo, gpk, prelit, numDir,
+		       ambR8, ambG8, ambB8, matcol))
+			useIdx = 1;
+#endif
 		setup3DDraw(tex != nil, 0, 1, 0,
 		    makeRGBA(255, 255, 255, 255), 1.0f, nil, GX_LIGHTNULL,
 		    sendColor, useIdx, ambK, posFrac, uvFrac);
+		if(useIdx){
+			GX_SetArray(GX_VA_POS, (void*)packPos, 3*sizeof(int16));
+			GX_SetArray(GX_VA_CLR0, gpk->colors, sizeof(RGBA));
+			if(tex)
+				GX_SetArray(GX_VA_TEX0, (void*)packUV, 2*sizeof(int16));
+		}
 		if(skinnedAtomic){
 			// Character rigs mirror their left-side bones, so those bone
 			// matrices carry a negative determinant and flip the winding
