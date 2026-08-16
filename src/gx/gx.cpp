@@ -38,6 +38,9 @@ namespace { struct DvdFsGuard {
 
 #include <ogc/lwp_watchdog.h>
 
+extern "C" void __console_init(void *fb, int xstart, int ystart, int xres,
+    int yres, int stride);
+
 void GeckoLog(const char*); // game-side USB Gecko logger (gamecube.cpp)
 extern unsigned gxCopyUs;   // defined below at global scope
 extern unsigned gxShowUs;   // whole showRaster duration
@@ -169,7 +172,16 @@ startGX(void)
 	uint32 need = VIDEO_GetFrameBufferSize(rmode);
 	if(::gxAdoptXfb && ::gxAdoptXfbSize >= need){
 		xfb[0] = ::gxAdoptXfb;
-		::gxAdoptXfb = nil;   // handed over; the console must not draw again
+		// Point the libogc console at the reserved scratch at 0xC1700000 —
+		// the region the panic screen uses, which is never scanned out. Once
+		// this buffer belongs to the game, every later printf would otherwise
+		// paint text straight over the frame, which is exactly what it did:
+		// the console flashed log lines across the picture whenever anything
+		// printed. Redirecting is better than silencing, because the panic
+		// handler still wants a console and the output stays on the Gecko.
+		__console_init((void*)0xC1700000, 20, 20, rmode->fbWidth,
+		    rmode->xfbHeight, rmode->fbWidth*VI_DISPLAY_PIX_SZ);
+		::gxAdoptXfb = nil;
 	}else
 		xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
