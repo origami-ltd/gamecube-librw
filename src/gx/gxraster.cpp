@@ -27,6 +27,10 @@ void registerPlatformPlugins(void) { }
 #include <gccore.h>
 #include <malloc.h>
 
+extern unsigned gxTexBuilds; // global counter, defined in gx.cpp
+extern unsigned gxTileUs;    // CPU time spent tiling textures this frame
+#include <ogc/lwp_watchdog.h>
+
 namespace rw {
 namespace gx {
 
@@ -37,9 +41,53 @@ struct GxRaster
 	GXTexObj obj;
 	bool32 hasTex;
 	bool32 dirty;
+	// Set when rasterLock had to fabricate a staging buffer because the real
+	// one was freed after tiling. Anything written into a fabricated buffer is
+	// partial at best (a mip level laid into a level-0-sized allocation) and
+	// zero at worst, so rebuilding the texture from it destroys a good one.
+	bool32 fabricated;
+	uint8 gxFmt; // GX_TF_CMPR or GX_TF_RGB5A3, chosen at first build
 };
 
 int32 nativeRasterOffset;
+bool32 gxTexCacheDirty;
+
+// Per-geometry display lists: one recorded FIFO block per mesh. Replaying
+// costs the GP a DMA and the CPU nothing, which is the whole point — the
+// immediate path spends the frame pushing ~54k vertices through the
+// write-gather pipe. A geometry plugin gives us both the storage and a
+// destructor, so lists die with the geometry the streamer evicts.
+int32 gxGeoOffset;
+uint32 gxDlBytes;
+
+static void*
+createGeoExt(void *object, int32 offset, int32)
+{
+	memset(PLUGINOFFSET(GxGeoExt, object, offset), 0, sizeof(GxGeoExt));
+	return object;
+}
+
+static void*
+destroyGeoExt(void *object, int32 offset, int32)
+{
+	GxGeoExt *g = PLUGINOFFSET(GxGeoExt, object, offset);
+	for(int32 i = 0; i < g->numLists; i++)
+		if(g->lists[i]){
+			gxDlBytes -= g->sizes[i];
+			free(g->lists[i]);
+		}
+	free(g->lists);
+	free(g->sizes);
+	memset(g, 0, sizeof(*g));
+	return object;
+}
+
+static void*
+copyGeoExt(void *dst, void *, int32 offset, int32)
+{
+	memset(PLUGINOFFSET(GxGeoExt, dst, offset), 0, sizeof(GxGeoExt));
+	return dst;
+}
 #define GETGXRASTEREXT(raster) PLUGINOFFSET(GxRaster, raster, nativeRasterOffset)
 
 static void*
@@ -73,6 +121,9 @@ copyNativeRaster(void *dst, void *, int32 offset, int32)
 void
 registerPlatformPlugins(void)
 {
+	gxGeoOffset = Geometry::registerPlugin(sizeof(GxGeoExt), ID_DRIVER,
+	                                       createGeoExt, destroyGeoExt,
+	                                       copyGeoExt);
 	nativeRasterOffset = Raster::registerPlugin(sizeof(GxRaster),
 	                                            ID_DRIVER,
 	                                            createNativeRaster,
@@ -83,30 +134,69 @@ registerPlatformPlugins(void)
 // Convert the linear staging pixels to GX_TF_RGB5A3: 4x4 texel tiles of 32
 // bytes, one big-endian uint16 per texel. 16-bit halves resident texture
 // memory vs RGBA8 — the difference between fitting the arena and exit(1).
-static void
-tileRGB5A3(uint8 *dst, Raster *raster)
+// point-sample one texel of the (possibly downscaled) GX copy
+static inline void
+sampleTexel(Raster *raster, int32 dx, int32 dy, int32 tw, int32 th,
+	uint8 *pr, uint8 *pg, uint8 *pb, uint8 *pa)
 {
 	int32 w = raster->width, h = raster->height;
-	for(int32 ty = 0; ty < h; ty += 4)
-	for(int32 tx = 0; tx < w; tx += 4){
+	uint8 r = 0, g = 0, b = 0, a = 0;
+	int32 sx = dx * w / tw, sy = dy * h / th;
+	if(dx < tw && dy < th && sx < w && sy < h){
+		uint8 *p = raster->pixels + sy*raster->stride;
+		int32 base = raster->format & 0xF00;
+		// C888/C565/C555 carry no alpha channel — byte 3 (or the top bit)
+		// is undefined padding. Sampling it anyway produced alpha 0, and
+		// the alpha test then threw the texel away: that is why ped bodies
+		// vanished while their C8888 hair and clothes drew fine.
+		bool noAlpha = base == Raster::C888 || base == Raster::C565 ||
+		    base == Raster::C555;
+		if(raster->depth == 32){
+			p += sx*4;
+			r = p[0]; g = p[1]; b = p[2];
+			a = noAlpha ? 255 : p[3];
+		}else if(raster->depth == 8 || raster->depth == 4){
+			// Palettised raster. Reading these as 16-bit produced garbage
+			// texels with garbage alpha, and the alpha test then discarded
+			// them — which is why ped skin vanished while their 32-bit
+			// hair and clothing textures drew fine.
+			uint8 *pal = raster->palette;
+			uint32 i = raster->depth == 8 ? p[sx] :
+			    (p[sx>>1] >> ((sx & 1) ? 4 : 0)) & 0xF;
+			if(pal){
+				pal += i*4;
+				r = pal[0]; g = pal[1]; b = pal[2]; a = pal[3];
+			}else{
+				r = g = b = (uint8)i; a = 255;
+			}
+		}else{
+			uint16 v = *(uint16*)(p + sx*2);
+			if(base == Raster::C565){
+				r = ((v>>11)&0x1F)<<3;
+				g = ((v>>5)&0x3F)<<2;
+				b = (v&0x1F)<<3;
+				a = 255;
+			}else{
+				r = ((v>>10)&0x1F)<<3;
+				g = ((v>>5)&0x1F)<<3;
+				b = (v&0x1F)<<3;
+				a = noAlpha ? 255 : ((v&0x8000) ? 255 : 0);
+			}
+		}
+	}
+	*pr = r; *pg = g; *pb = b; *pa = a;
+}
+
+static void
+tileRGB5A3(uint8 *dst, Raster *raster, int32 tw, int32 th)
+{
+	for(int32 ty = 0; ty < th; ty += 4)
+	for(int32 tx = 0; tx < tw; tx += 4){
 		uint16 *out = (uint16*)dst;
 		for(int32 y = 0; y < 4; y++)
 		for(int32 x = 0; x < 4; x++){
-			uint8 r = 0, g = 0, b = 0, a = 0;
-			int32 sx = tx + x, sy = ty + y;
-			if(sx < w && sy < h){
-				uint8 *p = raster->pixels + sy*raster->stride;
-				if(raster->depth == 32){
-					p += sx*4;
-					r = p[0]; g = p[1]; b = p[2]; a = p[3];
-				}else{
-					uint16 v = *(uint16*)(p + sx*2);
-					r = ((v>>10)&0x1F)<<3;
-					g = ((v>>5)&0x1F)<<3;
-					b = (v&0x1F)<<3;
-					a = (v&0x8000) ? 255 : 0;
-				}
-			}
+			uint8 r, g, b, a;
+			sampleTexel(raster, tx + x, ty + y, tw, th, &r, &g, &b, &a);
 			// >=0xE0 rounds to full 3-bit alpha anyway; use opaque 5:5:5.
 			if(a >= 0xE0)
 				*out++ = 0x8000 | ((r>>3)<<10) | ((g>>3)<<5) | (b>>3);
@@ -115,6 +205,145 @@ tileRGB5A3(uint8 *dst, Raster *raster)
 		}
 		dst += 32;
 	}
+}
+
+// GX_TF_CMPR: DXT1-style, 4bpp — a quarter of RGB5A3's footprint, which is
+// the difference between streaming churn and actually holding a scene in
+// the arena. Layout: 8x8 tiles of four 4x4 blocks (TL,TR,BL,BR); block =
+// two 565 colors (native big-endian store) + 4 index bytes, MSB-first pairs.
+// ponytail: box-fit encoder (min/max endpoints, projection indices) — fast
+// and fine for VC-era textures; upgrade path is a PCA/iterative refit.
+static inline uint16
+to565(uint8 r, uint8 g, uint8 b)
+{
+	return ((r>>3)<<11) | ((g>>2)<<5) | (b>>3);
+}
+
+static void
+tileCMPR(uint8 *dst, Raster *raster, int32 tw, int32 th)
+{
+	for(int32 ty = 0; ty < th; ty += 8)
+	for(int32 tx = 0; tx < tw; tx += 8)
+	for(int32 sub = 0; sub < 4; sub++){
+		int32 bx = tx + (sub & 1)*4, by = ty + (sub >> 1)*4;
+		uint8 px[16][4];
+		bool trans = false;
+		uint8 mn[3] = {255,255,255}, mx[3] = {0,0,0};
+		for(int32 i = 0; i < 16; i++){
+			sampleTexel(raster, bx + (i&3), by + (i>>2), tw, th,
+			    &px[i][0], &px[i][1], &px[i][2], &px[i][3]);
+			if(px[i][3] < 128){ trans = true; continue; }
+			for(int32 c = 0; c < 3; c++){
+				if(px[i][c] < mn[c]) mn[c] = px[i][c];
+				if(px[i][c] > mx[c]) mx[c] = px[i][c];
+			}
+		}
+		uint16 lo = to565(mn[0], mn[1], mn[2]);
+		uint16 hi = to565(mx[0], mx[1], mx[2]);
+		int32 dir[3] = { mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2] };
+		int32 len2 = dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2];
+		uint16 *out16 = (uint16*)dst;
+		uint8 *idx = dst + 4;
+		if(trans){
+			// alpha mode: c0 <= c1; palette lo, hi, mid, transparent
+			out16[0] = lo;
+			out16[1] = hi >= lo ? hi : lo;
+			for(int32 row = 0; row < 4; row++){
+				uint8 byte = 0;
+				for(int32 x = 0; x < 4; x++){
+					uint8 *p = px[row*4 + x];
+					uint8 v;
+					if(p[3] < 128)
+						v = 3;
+					else if(len2 == 0)
+						v = 0;
+					else{
+						int32 t = ((p[0]-mn[0])*dir[0] +
+						    (p[1]-mn[1])*dir[1] +
+						    (p[2]-mn[2])*dir[2]) * 4 / len2;
+						v = t <= 0 ? 0 : t >= 3 ? 1 : 2;
+					}
+					byte |= v << (6 - 2*x);
+				}
+				idx[row] = byte;
+			}
+		}else{
+			// opaque mode: c0 > c1; palette hi, lo, 2/3, 1/3
+			if(hi == lo){
+				out16[0] = hi | 1;
+				out16[1] = lo & ~1;
+				idx[0] = idx[1] = idx[2] = idx[3] = 0x55; // all c1 = lo
+			}else{
+				out16[0] = hi > lo ? hi : lo;
+				out16[1] = hi > lo ? lo : hi;
+				bool flip = hi < lo; // endpoints swapped vs min/max
+				for(int32 row = 0; row < 4; row++){
+					uint8 byte = 0;
+					for(int32 x = 0; x < 4; x++){
+						uint8 *p = px[row*4 + x];
+						int32 t = len2 ? ((p[0]-mn[0])*dir[0] +
+						    (p[1]-mn[1])*dir[1] +
+						    (p[2]-mn[2])*dir[2]) * 6 / len2 : 0;
+						// t in 0..6 along lo->hi
+						uint8 v = t >= 5 ? 0 : t <= 1 ? 1 : t >= 3 ? 2 : 3;
+						if(flip) v = v == 0 ? 1 : v == 1 ? 0 :
+						    v == 2 ? 3 : 2;
+						byte |= v << (6 - 2*x);
+					}
+					idx[row] = byte;
+				}
+			}
+		}
+		dst += 8;
+	}
+}
+
+// CMPR carries 1-bit alpha at best; textures with gradient alpha keep
+// RGB5A3. Scan the staging pixels once at build time.
+#define GX_USE_CMPR 1 // A/B: 0 = all textures RGB5A3, bypass the CMPR encoder
+
+static bool
+cmprEligible(Raster *raster)
+{
+	if(!GX_USE_CMPR)
+		return false;
+	if(raster->depth != 32)
+		return true; // 16-bit staging is already 1-bit alpha
+	for(int32 y = 0; y < raster->height; y++){
+		uint8 *p = raster->pixels + y*raster->stride;
+		for(int32 x = 0; x < raster->width; x++){
+			uint8 a = p[x*4 + 3];
+			if(a > 16 && a < 240)
+				return false;
+		}
+	}
+	return true;
+}
+
+void
+gxRasterProbe(Raster *raster, uint32 *gxFmt, uint32 *firstWord)
+{
+	*gxFmt = 0xFF;
+	*firstWord = 0;
+	if(raster == nil)
+		return;
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	if(ext->hasTex)
+		*gxFmt = ext->gxFmt;
+	if(ext->tiled)
+		*firstWord = *(uint32*)ext->tiled;
+}
+
+// Does sampling this raster ever yield alpha < 255? Formats without an
+// alpha channel never can, which lets the draw path keep early-Z on.
+bool32
+gxRasterHasAlpha(Raster *raster)
+{
+	if(raster == nil)
+		return 0;
+	int32 base = raster->format & 0xF00;
+	return !(base == Raster::C888 || base == Raster::C565 ||
+	         base == Raster::C555 || base == Raster::LUM8);
 }
 
 // Lazily (re)build the GX texture for a raster; returns nil if it has no pixels.
@@ -132,20 +361,42 @@ gxGetTexture(Raster *raster)
 	if(raster->pixels == nil)
 		return ext->hasTex ? &ext->obj : nil;
 
-	// GX tiles are 4x4; round the allocation up.
-	int32 tw = (raster->width + 3) & ~3;
-	int32 th = (raster->height + 3) & ~3;
-	int32 size = tw*th*2;
+	// Format: CMPR (4bpp) unless the texture needs gradient alpha, then
+	// RGB5A3 (16bpp). Decided once per raster; rebuilds keep the format
+	// so the tiled buffer size stays valid.
+	if(!ext->hasTex)
+		ext->gxFmt = cmprEligible(raster) ? GX_TF_CMPR : GX_TF_RGB5A3;
+	bool cmpr = ext->gxFmt == GX_TF_CMPR;
+
+	// Round dims up to the tile size (CMPR 8, RGB5A3 4). Cap at 512px per
+	// axis — enough for VC's big textures at 640x480 output; 1024s are
+	// what blow the console heap. UVs are normalized so sampling is safe.
+	// (Tried 256 to buy arena headroom: free-at-crash moved 2289K -> 2198K,
+	// i.e. no effect. The OOM is fragmentation on one large contiguous
+	// request, not resident texture bytes — don't re-try this.)
+	int32 align = cmpr ? 7 : 3;
+	int32 tw = raster->width > 512 ? 512 : (raster->width + align) & ~align;
+	int32 th = raster->height > 512 ? 512 : (raster->height + align) & ~align;
+	if(tw < align+1) tw = align+1;
+	if(th < align+1) th = align+1;
+	int32 size = cmpr ? tw*th/2 : tw*th*2;
 	if(ext->tiled == nil){
 		ext->tiled = memalign(32, size);
 		if(ext->tiled == nil)
 			return nil;
 	}
-	tileRGB5A3((uint8*)ext->tiled, raster);
+	{
+		unsigned long long t0 = gettime();
+		if(cmpr)
+			tileCMPR((uint8*)ext->tiled, raster, tw, th);
+		else
+			tileRGB5A3((uint8*)ext->tiled, raster, tw, th);
+		::gxTileUs += (unsigned)ticks_to_microsecs(gettime() - t0);
+	}
 	DCFlushRange(ext->tiled, size);
 
-	GX_InitTexObj(&ext->obj, ext->tiled, raster->width, raster->height,
-	    GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&ext->obj, ext->tiled, tw, th,
+	    ext->gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
 	    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
 	// no GX_InvalidateTexAll here: textures build at stream time with no
@@ -153,6 +404,15 @@ gxGetTexture(Raster *raster)
 
 	ext->hasTex = 1;
 	ext->dirty = 0;
+	// A texture built mid-frame leaves a stale TMEM copy: the GP keeps
+	// sampling whatever was cached at that address, so a freshly streamed
+	// ped/vehicle mesh draws with another model's texels. beginUpdate's
+	// once-per-frame invalidate is too late for anything built after it.
+	// Deferred so the invalidate lands between draws, not at stream time
+	// (per-texture invalidation there floods the FIFO with no frame
+	// draining it).
+	gxTexCacheDirty = 1;
+	::gxTexBuilds++;
 
 	// ponytail: plain textures never re-lock once drawn, and keeping both the
 	// linear staging and the tiled copy doubles texture cost against a 16MB
@@ -196,7 +456,10 @@ rasterCreate(Raster *raster)
 		raster->depth = depth;
 		raster->stride = raster->width*(depth/8);
 		int32 size = raster->stride*raster->height;
-		raster->pixels = (uint8*)rwNew(size, MEMDUR_EVENT | ID_DRIVER);
+		// non-must alloc: a failed texture must fail the stream load (which
+		// evicts and retries), not exit(1) the whole game via mustmalloc
+		raster->pixels = (uint8*)engine->memfuncs.rwmalloc(size,
+		    MEMDUR_EVENT | ID_DRIVER);
 		if(raster->pixels == nil){
 			RWERROR((ERR_ALLOC, size));
 			return nil;
@@ -221,11 +484,14 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 	// staging may have been freed after tiling; re-materialize for writers
 	// (mip uploads in readAsImage lock again after level 0 was tiled)
 	if(raster->pixels == nil && raster->stride && raster->height){
-		raster->pixels = (uint8*)rwNew(raster->stride*raster->height,
-		    MEMDUR_EVENT | ID_DRIVER);
+		raster->pixels = (uint8*)engine->memfuncs.rwmalloc(
+		    raster->stride*raster->height, MEMDUR_EVENT | ID_DRIVER);
 		if(raster->pixels)
 			memset(raster->pixels, 0, raster->stride*raster->height);
 		raster->originalPixels = raster->pixels;
+		// Remember this buffer is not the real staging data, so unlock does
+		// not mark a already-built texture dirty and rebuild it from zeros.
+		GETGXRASTEREXT(raster)->fabricated = 1;
 	}
 	raster->privateFlags |= Raster::PRIVATELOCK_WRITE;
 	return raster->pixels;
@@ -235,7 +501,21 @@ void
 rasterUnlock(Raster *raster, int32)
 {
 	raster->privateFlags &= ~Raster::PRIVATELOCK_WRITE;
-	GETGXRASTEREXT(raster)->dirty = 1;
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	// Only a lock over the real staging data may invalidate a built texture.
+	// A fabricated buffer (see rasterLock) holds zeros or a single mip level
+	// in a level-0-sized allocation; rebuilding from it is what turned already
+	// correct textures black or mapped the wrong part of an atlas onto a mesh.
+	if(ext->fabricated){
+		ext->fabricated = 0;
+		if(ext->tiled){
+			rwFree(raster->pixels);
+			raster->pixels = nil;
+			raster->originalPixels = nil;
+		}
+		return;
+	}
+	ext->dirty = 1;
 }
 
 uint8*
@@ -318,13 +598,14 @@ rasterFromImageBody(Raster *raster, Image *image)
 		return 0;
 	}
 
-	Image *truecolor = nil;
-	if(image->depth <= 8){
-		truecolor = Image::create(image->width, image->height, 32);
-		truecolor->allocate();
+	// unpalettize converts in place to depth 24 or 32, both of which the
+	// loop below already handles. This used to also create and allocate a
+	// full-size 32bpp Image that was never written to and destroyed at the
+	// end of the function: a transient width*height*4 spike for every
+	// palettised texture streamed, feeding the arena fragmentation that
+	// makes the large Geometry::create realloc fail.
+	if(image->depth <= 8)
 		image->unpalettize(image->hasAlpha());
-		image = image;
-	}
 
 	uint8 *dst = raster->pixels;
 	if(dst == nil)
@@ -352,8 +633,6 @@ rasterFromImageBody(Raster *raster, Image *image)
 		}
 	}
 
-	if(truecolor)
-		truecolor->destroy();
 	return 1;
 }
 

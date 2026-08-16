@@ -254,9 +254,19 @@ cameraSync(ObjectWithFrame *obj)
 	cam->frustumBoundBox.calculate(cam->frustumCorners, 8);
 }
 
+// currentWorld used to be assigned on begin and never restored on end, so a
+// camera that belongs to no world left engine->currentWorld == nil for
+// everything drawn afterwards. GTA does exactly that: CShadowCamera is built
+// with RwCameraCreate() and never added to a world, so every ped/vehicle drawn
+// after a shadow pass evaluated its LIGHT flag against a nil world, got no
+// ambient and no directional, and rendered black. Save and restore instead.
+// Cameras do not nest in RW, so one slot is enough.
+static World *prevWorld;
+
 void
 worldBeginUpdateCB(Camera *cam)
 {
+	prevWorld = engine->currentWorld;
 	engine->currentWorld = cam->world;
 	cam->originalBeginUpdate(cam);
 }
@@ -265,6 +275,7 @@ void
 worldEndUpdateCB(Camera *cam)
 {
 	cam->originalEndUpdate(cam);
+	engine->currentWorld = prevWorld;
 }
 
 static void

@@ -255,7 +255,10 @@ createTexture(int32 width, int32 height, int32 numlevels, uint32 usage, uint32 f
 	}
 	if(metadataSize > SIZE_MAX-size)
 		return nil;
-	uint8 *data = (uint8*)rwNew(metadataSize+size, MEMDUR_EVENT | ID_DRIVER);
+	// non-must alloc: on console this must fail the texture read (streaming
+	// evicts and retries), not exit the process
+	uint8 *data = (uint8*)engine->memfuncs.rwmalloc(metadataSize+size,
+	    MEMDUR_EVENT | ID_DRIVER);
 	if(data == nil)
 		return nil;
 	RasterLevels *levels = (RasterLevels*)data;

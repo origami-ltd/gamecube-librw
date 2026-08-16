@@ -13,6 +13,13 @@
 
 #define PLUGIN_ID ID_GEOMETRY
 
+// Geometry allocations that failed and were soft-failed up to the streamer.
+// Surfaced on the console HUD: these are silent by design (the load is retried
+// rather than exit(1)-ing), and a silent load failure looks exactly like a
+// broken open world — chunks that never appear, no collision, falling through
+// the map. A visible count separates "out of memory" from a rendering fault.
+unsigned rwGeoAllocFails;
+
 namespace rw {
 
 int32 Geometry::numAllocated;
@@ -55,7 +62,23 @@ Geometry::create(int32 numVerts, int32 numTris, uint32 flags)
 			sz += geo->numVertices*sizeof(RGBA);
 		sz += geo->numTexCoordSets*geo->numVertices*sizeof(TexCoords);
 
-		uint8 *data = (uint8*)rwNew(sz, MEMDUR_EVENT | ID_GEOMETRY);
+		// non-must alloc: the largest single contiguous request in the
+		// geometry path (triangles + colors + texcoords in one block). On a
+		// fragmented console arena this fails with megabytes still free, and
+		// as a must-alloc it took the whole process down mid-stream. Failing
+		// the load instead lets the streamer evict and retry — the same
+		// contract rasterCreate and the d3d texture path already use.
+		// sz == 0 is legal (no triangles, no prelit, no tex coords) and must
+		// stay non-fatal: mustmalloc returned nil for it without exiting, so
+		// treating nil as failure here would fail loads that used to work.
+		uint8 *data = (uint8*)rwMalloc(sz, MEMDUR_EVENT | ID_GEOMETRY);
+		if(data == nil && sz > 0){
+			RWERROR((ERR_ALLOC, sz));
+			rwGeoAllocFails++;
+			rwFree(geo);
+			numAllocated--;
+			return nil;
+		}
 		geo->triangles = (Triangle*)data;
 		data += geo->numTriangles*sizeof(Triangle);
 		if(geo->flags & PRELIT && geo->numVertices){
@@ -75,6 +98,13 @@ Geometry::create(int32 numVerts, int32 numTris, uint32 flags)
 	geo->numMorphTargets = 0;
 	geo->morphTargets = nil;
 	geo->addMorphTargets(1);
+	if(geo->morphTargets == nil){
+		// out of memory above; every caller already handles a nil geometry
+		rwFree(geo->triangles); // the combined attribute block, or nil
+		rwFree(geo);
+		numAllocated--;
+		return nil;
+	}
 
 	geo->matList.init();
 	geo->lockedSinceInst = 0;
@@ -320,7 +350,17 @@ Geometry::addMorphTargets(int32 n)
 		while(len--)
 			*--dst = *--src;
 	}else{
-		mts = (MorphTarget*)rwNew(n*sz, MEMDUR_EVENT | ID_GEOMETRY);
+		// non-must alloc: on a small console arena this is one of the two big
+		// contiguous requests per geometry, and it is the one that used to
+		// exit(1) mid-stream. Leaving morphTargets nil and numMorphTargets
+		// unchanged lets the caller bail cleanly, so the stream load fails
+		// and the streamer evicts and retries instead of killing the process.
+		mts = (MorphTarget*)rwMalloc(n*sz, MEMDUR_EVENT | ID_GEOMETRY);
+		if(mts == nil){
+			RWERROR((ERR_ALLOC, n*sz));
+			rwGeoAllocFails++;
+			return;
+		}
 		this->morphTargets = mts;
 	}
 

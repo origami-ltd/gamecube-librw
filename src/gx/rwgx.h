@@ -64,6 +64,21 @@ struct Im3DVertex
 	float getV(void) { return this->v; }
 };
 
+// per-geometry cache of recorded draw commands, one list per mesh
+struct GxGeoExt
+{
+	void **lists;
+	uint32 *sizes;
+	int32 numLists;
+};
+extern int32 gxGeoOffset;
+extern uint32 gxDlBytes;
+
+bool32 gxRasterHasAlpha(Raster *raster);
+// Debug probe: tiled GX format and the first tiled word. Separates "the
+// texture is black in RAM" from "the texture is fine and the colour channel
+// zeroes it" without a second boot.
+void gxRasterProbe(Raster *raster, uint32 *gxFmt, uint32 *firstWord);
 void registerPlatformPlugins(void);
 ObjPipeline *makeDefaultPipeline(void);
 

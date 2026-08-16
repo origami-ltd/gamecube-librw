@@ -481,6 +481,12 @@ Skin::setPipeline(Atomic *a, int32 type)
 {
 	(void)type;
 	a->pipeline = skinGlobals.pipelines[rw::platform];
+#ifdef RW_GAMECUBE
+	// no GX skin pipeline: the dummy pipe draws NOTHING (invisible peds).
+	// nil falls back to the driver default — bind pose, no skinning.
+	if(a->pipeline == skinGlobals.dummypipe)
+		a->pipeline = nil;
+#endif
 }
 
 }

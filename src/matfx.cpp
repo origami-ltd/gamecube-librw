@@ -570,6 +570,12 @@ MatFX::enableEffects(Atomic *atomic)
 {
 	*PLUGINOFFSET(int32, atomic, matFXGlobals.atomicOffset) = 1;
 	atomic->pipeline = matFXGlobals.pipelines[rw::platform];
+#ifdef RW_GAMECUBE
+	// no GX matfx pipeline: a dummy pipe draws NOTHING (invisible vehicle
+	// bodies). nil falls back to the driver default — base pass, no fx.
+	if(atomic->pipeline == matFXGlobals.dummypipe)
+		atomic->pipeline = nil;
+#endif
 }
 
 // This prevents setting the pipeline on clone
