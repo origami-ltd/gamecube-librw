@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -175,6 +176,86 @@ MemoryFunctions defaultMemfuncs = {
 	nil
 };
 
+#ifdef RW_GAMECUBE
+// Allocation size histogram. The console HUD measured roughly 4.4MB of free
+// heap split across ~9200 chunks — the heap is shattered, and large requests
+// fail while the total looks healthy. Before sizing any pool or block
+// allocator, measure what sizes are actually being asked for and how often;
+// picking a block size by intuition is what has been swinging the streaming
+// reserve back and forth without fixing anything.
+//
+// 16 buckets, powers of two from <=64 bytes up to >1MB. Live count per bucket
+// shows what is resident; total shows the churn that does the fragmenting.
+unsigned rwAllocLive[16], rwAllocTotal[16];
+unsigned rwAllocLiveBytes[16];
+static inline int rwSizeBucket(size_t sz)
+{
+	int b = 0;
+	size_t n = 64;
+	while(b < 15 && sz > n){ n <<= 1; b++; }
+	return b;
+}
+
+static void*
+malloc_hist(size_t sz, uint32 hint)
+{
+	void *p = malloc_h(sz, hint);
+	if(p){
+		// Bucket by the size the allocator really handed out, so free() can
+		// find the same bucket again via malloc_usable_size and the live
+		// count actually means something. Bucketing by the requested size
+		// would not round-trip.
+		size_t got = malloc_usable_size(p);
+		int b = rwSizeBucket(got);
+		rwAllocLive[b]++;
+		rwAllocTotal[b]++;
+		rwAllocLiveBytes[b] += got;
+	}
+	return p;
+}
+static void*
+realloc_hist(void *p, size_t sz, uint32 hint)
+{
+	if(p){
+		size_t got = malloc_usable_size(p);
+		int b = rwSizeBucket(got);
+		if(rwAllocLive[b]){
+			rwAllocLive[b]--;
+			rwAllocLiveBytes[b] -= rwAllocLiveBytes[b] >= got ? got : rwAllocLiveBytes[b];
+		}
+	}
+	void *q = realloc_h(p, sz, hint);
+	if(q){
+		size_t got = malloc_usable_size(q);
+		int b = rwSizeBucket(got);
+		rwAllocLive[b]++;
+		rwAllocTotal[b]++;
+		rwAllocLiveBytes[b] += got;
+	}
+	return q;
+}
+static void
+free_hist(void *p)
+{
+	if(p){
+		size_t got = malloc_usable_size(p);
+		int b = rwSizeBucket(got);
+		if(rwAllocLive[b]){
+			rwAllocLive[b]--;
+			rwAllocLiveBytes[b] -= rwAllocLiveBytes[b] >= got ? got : rwAllocLiveBytes[b];
+		}
+	}
+	free(p);
+}
+MemoryFunctions histMemfuncs = {
+	malloc_hist,
+	realloc_hist,
+	free_hist,
+	nil,
+	nil
+};
+#endif
+
 MemoryFunctions managedMemfuncs = {
 	malloc_managed,
 	realloc_managed,
@@ -198,7 +279,11 @@ Engine::init(MemoryFunctions *memfuncs)
 	if(memfuncs)
 		Engine::memfuncs = *memfuncs;
 	else
+#ifdef RW_GAMECUBE
+		Engine::memfuncs = histMemfuncs;
+#else
 		Engine::memfuncs = defaultMemfuncs;
+#endif
 
 	if(Engine::memfuncs.rwmustmalloc == nil)
 		Engine::memfuncs.rwmustmalloc = mustmalloc_h;
