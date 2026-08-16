@@ -52,6 +52,21 @@ namespace { struct DvdFsGuard {
 // is here and nothing was counting it.
 unsigned rwTexAllocFails;
 
+// Live bytes held by GX-tiled textures, tracked exactly.
+//
+// This is the hole in the streaming accounting. gResidentCost measures a heap
+// delta across the load, but gxGetTexture allocates the tiled buffer at the
+// FIRST DRAW — after that window has closed — so up to 512KB per texture is
+// never charged to any stream entry. ms_memoryUsed is therefore systematically
+// under the truth, the streamer believes it has room it does not have, keeps
+// loading, and the texture allocation eventually fails. Silently, which is how
+// it surfaces as black silhouettes rather than as an out-of-memory.
+//
+// Reported rather than folded into ms_memoryUsed for now: adding it changes
+// what the streamer evicts, and that needs to be a measured change rather than
+// another blind one.
+unsigned gxTiledBytes;
+
 extern unsigned gxTexBuilds; // global counter, defined in gx.cpp
 extern unsigned gxTileUs;    // CPU time spent tiling textures this frame
 #include <ogc/lwp_watchdog.h>
@@ -72,6 +87,7 @@ struct GxRaster
 	// zero at worst, so rebuilding the texture from it destroys a good one.
 	bool32 fabricated;
 	uint8 gxFmt; // GX_TF_CMPR or GX_TF_RGB5A3, chosen at first build
+	uint32 tiledSize; // so the free path can subtract exactly what it added
 };
 
 int32 nativeRasterOffset;
@@ -304,6 +320,8 @@ destroyNativeRaster(void *object, int32 offset, int32)
 {
 	GxRaster *ext = PLUGINOFFSET(GxRaster, object, offset);
 	if(ext->tiled){
+		::gxTiledBytes -= ext->tiledSize;
+		ext->tiledSize = 0;
 		free(ext->tiled);
 		ext->tiled = nil;
 	}
@@ -583,6 +601,8 @@ gxGetTexture(Raster *raster)
 	int32 size = cmpr ? tw*th/2 : tw*th*2;
 	if(ext->tiled == nil){
 		ext->tiled = memalign(32, size);
+		if(ext->tiled)
+			ext->tiledSize = (uint32)size, ::gxTiledBytes += (uint32)size;
 		if(ext->tiled == nil){
 			// Counted, because this failing silently is what "black
 			// silhouettes with oom 0" actually is. The geometry loaded, this
