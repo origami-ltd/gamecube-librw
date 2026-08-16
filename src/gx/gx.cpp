@@ -487,7 +487,24 @@ showRaster(Raster *raster, uint32 flags)
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 	GX_SetColorUpdate(GX_TRUE);
 
-	currentXfb ^= 1;
+	// Pick a buffer the VI is not scanning out right now. Normally that is
+	// simply the other one; when our previous flip has not been picked up yet
+	// it is the one we just drew, so we overwrite a frame nobody ever saw
+	// rather than stalling. That is a triple buffer's behaviour without paying
+	// for a third 614KB XFB.
+	//
+	// This is what lets the retrace stall go. Presentation stays tear-free
+	// either way — VIDEO_Flush hands the buffer to the VI, which only ever
+	// switches at a retrace — so VIDEO_WaitVSync was never what made the image
+	// clean, it only paced the CPU. And pacing the CPU is precisely what
+	// quantised the frame rate: a 17ms frame missed one retrace and presented
+	// at the next, so the game could only ever read 60 or 30 and nothing
+	// between. Without the stall the rate floats and the frame limiter caps it.
+	{
+		void *shown = VIDEO_GetCurrentFramebuffer();
+		int next = currentXfb ^ 1;
+		currentXfb = (xfb[next] == shown) ? currentXfb : next;
+	}
 	{
 		// GX_CopyDisp only queues commands, so it should be ~free. If it
 		// is not, the CPU is blocking on FIFO space — i.e. waiting for the
