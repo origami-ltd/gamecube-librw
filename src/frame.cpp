@@ -13,7 +13,25 @@
 
 #define PLUGIN_ID ID_FRAMELIST
 
+#ifdef RW_GAMECUBE
+void gcFatalPark(const char *tag, const char *msg);   // the game's park screen
+#endif
+
 namespace rw {
+
+#ifdef RW_GAMECUBE
+void
+ObjectWithFrame::sync(void)
+{
+	if(this->syncCB == nil){
+		char d[64];
+		snprintf(d, sizeof(d), "obj=%p type=%d sub=%d", (void*)this,
+		    (int)this->object.type, (int)this->object.subType);
+		gcFatalPark("null-syncCB", d);
+	}
+	this->syncCB(this);
+}
+#endif
 
 int32 Frame::numAllocated;
 

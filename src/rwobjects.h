@@ -116,7 +116,13 @@ struct ObjectWithFrame
 			f->updateObjects();
 		}
 	}
+#ifdef RW_GAMECUBE
+	// A zeroed syncCB parked a boot as an anonymous PC=0 "Interrupt
+	// exception" (08-20). Park with the object's identity instead.
+	void sync(void);
+#else
 	void sync(void){ this->syncCB(this); }
+#endif
 	static ObjectWithFrame *fromFrame(LLLink *lnk){
 		return LLLinkGetData(lnk, ObjectWithFrame, inFrame);
 	}

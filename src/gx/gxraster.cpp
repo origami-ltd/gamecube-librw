@@ -29,6 +29,12 @@ void registerPlatformPlugins(void) { }
 
 #include <gccore.h>
 #include <malloc.h>
+// Texture/vertex buffers are MEM1, on BOTH targets. The GameCube has no
+// MEM2; routing them to the Wii's MEM2 made the dev build a 64MB fantasy
+// that could not represent the ship target (08-20). MEM1 pressure gets
+// solved in MEM1 or in ARAM, never here.
+#define gxTexAlloc(sz) memalign(32, (sz))
+#define gxTexFree(p) free(p)
 
 // libfat is shared with the game's streaming worker and must be serialised;
 // the lock lives in CdStream_gamecube.cpp. Declared rather than included
@@ -332,7 +338,7 @@ destroyNativeRaster(void *object, int32 offset, int32)
 			CStreamingTexBytes(-(long)ext->tiledSize);
 		ext->tiledSize = 0;
 		ext->tiledCharged = 0;
-		free(ext->tiled);
+		gxTexFree(ext->tiled);
 		ext->tiled = nil;
 	}
 	ext->hasTex = 0;
@@ -576,6 +582,42 @@ gxRasterHasAlpha(Raster *raster)
 }
 
 // Lazily (re)build the GX texture for a raster; returns nil if it has no pixels.
+// EFB -> this raster's tiled buffer, by GP copy. The raster half of
+// rasterRenderFast (gx.cpp), here because GxRaster is private to this file.
+// Caller owns the copy-filter state around this.
+bool32
+gxGrabEFB(Raster *dst, int32 w, int32 h)
+{
+	GxRaster *ext = GETGXRASTEREXT(dst);
+	// RGB565: no alpha to preserve in a frame grab, half the bytes of RGBA8.
+	uint32 need = GX_GetTexBufferSize(w, h, GX_TF_RGB565, GX_FALSE, 0);
+	if(ext->tiled == nil || ext->tiledSize < need){
+		if(ext->tiled)
+			gxTexFree(ext->tiled);
+		ext->tiled = (void*)gxTexAlloc(need);
+		if(ext->tiled == nil)
+			return 0;
+		ext->tiledSize = need;
+	}
+	// The CPU cache may hold lines over this buffer; a writeback after the
+	// GP's DMA would corrupt the copy.
+	DCInvalidateRange(ext->tiled, need);
+	GX_SetTexCopySrc(0, 0, w, h);
+	GX_SetTexCopyDst(w, h, GX_TF_RGB565, GX_FALSE);
+	GX_CopyTex(ext->tiled, GX_FALSE);
+	// Bounded by hardware: waits for the copy pipeline to drain, so a draw
+	// that samples this texture next cannot race the GP writing it.
+	GX_PixModeSync();
+	GX_InitTexObj(&ext->obj, ext->tiled, w, h, GX_TF_RGB565,
+	    GX_CLAMP, GX_CLAMP, GX_FALSE);
+	ext->hasTex = 1;
+	ext->dirty = 0;
+	ext->fabricated = 0;
+	ext->gxFmt = GX_TF_RGB565;
+	gxTexCacheDirty = 1;   // TMEM may cache the previous frame at this address
+	return 1;
+}
+
 GXTexObj*
 gxGetTexture(Raster *raster)
 {
@@ -610,7 +652,7 @@ gxGetTexture(Raster *raster)
 	if(th < align+1) th = align+1;
 	int32 size = cmpr ? tw*th/2 : tw*th*2;
 	if(ext->tiled == nil){
-		ext->tiled = memalign(32, size);
+		ext->tiled = gxTexAlloc(size);
 		if(ext->tiled){
 			ext->tiledSize = (uint32)size;
 			::gxTiledBytes += (uint32)size;
@@ -631,6 +673,25 @@ gxGetTexture(Raster *raster)
 			// the budget was being tuned against was invisible to the readout
 			// used to tune it.
 			::rwTexAllocFails++;
+#if defined(GTA_OGC) && !defined(HW_RVL)
+			// The disc build's boot pin: name this failure and the memory
+			// state on the card, the one debug channel this target has.
+			{
+				static int said;
+				if(said < 4){
+					said++;
+					struct mallinfo mi = mallinfo();
+					FILE *df = fopen("mc:/diag2.bin", "wb");
+					if(df){
+						fprintf(df, "TEXALLOC fail %dx%d sz=%d free=%uK frags=%u fails=%u",
+						    (int)tw, (int)th, (int)size,
+						    (unsigned)(mi.fordblks>>10), (unsigned)mi.ordblks,
+						    (unsigned)::rwTexAllocFails);
+						fclose(df);
+					}
+				}
+			}
+#endif
 			return nil;
 		}
 	}
@@ -691,6 +752,11 @@ rasterCreate(Raster *raster)
 
 	switch(raster->type){
 	// The EFB is the camera target; there is no pixel buffer to allocate.
+	// CAMERATEXTURE the same: its content arrives by GP copy
+	// (rasterRenderFast), never from the CPU, so the linear pixel buffer
+	// would be dead weight — 600KB per postfx buffer. gxGetTexture already
+	// tolerates pixels == nil.
+	case Raster::CAMERATEXTURE:
 	case Raster::CAMERA:
 	case Raster::ZBUFFER:
 		raster->flags |= Raster::DONTALLOCATE;
@@ -699,7 +765,6 @@ rasterCreate(Raster *raster)
 		break;
 
 	case Raster::TEXTURE:
-	case Raster::CAMERATEXTURE:
 	default: {
 		int32 depth = raster->depth ? raster->depth : 32;
 		raster->depth = depth;
@@ -943,6 +1008,13 @@ gxNativeFail(const char *why, uint32 a, uint32 b)
 	DVD_FS_GUARD;
 	FILE *f = fopen("dvd:/native.log", "a");
 	if(f){ fprintf(f, "%s\n", line); fclose(f); }
+#if defined(GTA_OGC) && !defined(HW_RVL)
+	// The disc build cannot write native.log; the memory card is the one
+	// debug channel this target has. This line is what names the texture
+	// load the streamer retries forever.
+	f = fopen("mc:/diag.bin", "wb");
+	if(f){ fprintf(f, "%s", line); fclose(f); }
+#endif
 }
 
 Texture*

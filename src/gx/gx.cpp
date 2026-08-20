@@ -79,7 +79,11 @@ namespace gx {
 // the CPU actually matters and memory has been re-budgeted for it.
 #define GX_FORCE_PROGRESSIVE 1 // 480p even when the cable check says no; see startGX
 #define GX_DL_BUDGET 0
-#define GX_USE_INDEXED 0 // regression bisect: 1 = GP DMA vertex arrays
+// ON, with the measurement that flipped it: the same night alley read
+// 29fps/work29/oth18.7 direct and 59fps/work11/oth1.8 indexed — the "oth"
+// residual was CPU vertex submission the rnd timer never covered, and the
+// GP's DMA fetch eats it. Full-run: 123 samples at 16.6ms vs 22 at 33.3ms.
+#define GX_USE_INDEXED 1 // 1 = GP DMA vertex arrays
 // debug: dump every input to the skinned (ped) draw over USB Gecko, bounded
 // so it cannot flood the FIFO or the frame. Peds are the only geometry on
 // the GX hardware-lighting path, so this is where "black characters" lives.
@@ -109,11 +113,119 @@ static uint32 stVertexAlpha = 0;
 // rwRENDERSTATEVERTEXALPHAENABLE because on every other platform it does not
 // have to.
 static uint32 stTextureAlpha = 0;
+// Whether the bound MATERIAL carries alpha. The sibling of stTextureAlpha, and
+// the half that was still missing: gl3render, gl3skin, gl3matfx, d3d9render,
+// d3d9skin and d3d9matfx all do
+//     SetRenderState(VERTEXALPHA, inst->vertexAlpha || m->color.alpha != 255)
+// once per mesh, and this backend has no equivalent line anywhere — grep
+// VERTEXALPHA here and the only hits are the setRenderState handler and its
+// getter. So an atomic whose transparency comes from RpMaterialSetColor drew
+// fully opaque, and because stVertexAlpha is a sticky global it would blend
+// correctly only when some unrelated draw happened to leave it set. That is
+// the 3d marker (models/generic/zonecylb.dff, C3dMarker::Render) losing its
+// glow depending on what else is on screen.
+static uint32 stMaterialAlpha = 0;
 static uint32 stSrcBlend = BLENDSRCALPHA, stDstBlend = BLENDINVSRCALPHA;
 static uint32 stAlphaFunc = ALPHAGREATEREQUAL, stAlphaRef = 10;
 static uint32 stCullMode = CULLNONE;
+// Stencil, emulated with EFB destination alpha (GX has none of its own).
+// Two shapes cover everything the game asks for (MBlur.cpp):
+//   ALWAYS + REPLACE  -> the draw also writes its alpha into the EFB: the mask.
+//   EQUAL  + KEEP     -> the draw blends src*dstAlpha + dst*(1-dstAlpha):
+//                        confined to where the mask wrote.
+// Everything else (ref/mask/writemask, zfail) is accepted and ignored — the
+// game only ever uses ref=1 with full masks.
+// ---- extra additive TEV stage: matfx env-maps and ped rim light ----------
+//
+// One mechanism serves both: an armed GXTexObj sampled through a TG_NRM
+// texgen (spheremap UVs from the vertex normal via GX_TEXMTX0) and added to
+// PREV scaled by a konst colour. For vehicles the texture is the material's
+// matfx environment map; for peds it is a generated radial ramp whose value
+// rises toward edge-on normals — which IS a rim light, computed by the TEV.
+// The vertex-normal plumbing (descriptor + both emission paths + the bound
+// array) already existed behind hwLights; the stage just turns it back on for
+// armed meshes.
+bool32 gxRimEnable;          // <- CustomPipes::RimlightEnable, copied by the skel
+// Menu resolution pref, written through an int8 by the frontend (the CFO
+// (int8*) rule) and applied once in startGX. 0=480p, 1=528p, 2=720p label.
+int8 gxEfbResPref;
+// The one reader for the boot-time pref: the skel (RsGlobal sizing) and
+// startGX (EFB growth) both call it after the fs mounts. Absent = 480p.
+int8
+gxReadEfbPref(void)
+{
+	FILE *prefF = fopen("dvd:/reVC.INI", "r");
+	if(prefF){
+		char prefLn[128];
+		while(fgets(prefLn, sizeof(prefLn), prefF))
+			if(strncmp(prefLn, "EfbHeight", 9) == 0 && strchr(prefLn, '='))
+				gxEfbResPref = (int8)atoi(strchr(prefLn, '=') + 1);
+		fclose(prefF);
+	}
+	{
+		FILE *bl = fopen("dvd:/revc_boot.log", "a");
+		if(bl){
+			fprintf(bl, "efbpref: ini=%s pref=%d\n",
+			    prefF ? "open" : "MISSING", (int)gxEfbResPref);
+			fclose(bl);
+		}
+	}
+	return gxEfbResPref;
+}
+uint32 gxCopyFilterLevel;    // <- m_nPrefsMSAALevel: 0 sharp, >0 smoothing filter
+// Road gloss and world lightmaps, same bridge pattern. The lookup is a
+// function pointer installed by the game (re3.cpp) because the gloss table
+// lives in CustomPipes; librw stays linkable without it.
+bool32 gxGlossEnable;
+float gxGlossMult = 1.0f;
+bool32 gxLightmapEnable;
+float gxLightmapBlend;       // WorldLightmapBlend.Get()*LightmapMult, per frame
+Texture *(*gxGlossLookup)(Material*);
+static GXTexObj *gxEnvTex;   // armed per mesh, nil = stage off
+static bool32 gxEnvUV2;      // stage samples UV set 1 instead of the normal
+static GXColor gxEnvK = {255,255,255,255};
+static GXTexObj gxRimObj;
+static bool32 gxRimReady;
+
+// 64x64 I8 radial ramp, bright at the rim. I8 tiles are 8x4 texels.
+static GXTexObj*
+gxRimRamp(void)
+{
+	if(gxRimReady)
+		return &gxRimObj;
+	enum { W = 64, H = 64 };
+	static u8 *buf;
+	if(buf == nil)
+		buf = (u8*)memalign(32, W*H);
+	if(buf == nil)
+		return nil;
+	u8 *d = buf;
+	for(int ty = 0; ty < H; ty += 4)
+	for(int tx = 0; tx < W; tx += 8)
+	for(int y = ty; y < ty+4; y++)
+	for(int x = tx; x < tx+8; x++){
+		// spheremap uv: a screen-facing normal lands at the centre,
+		// edge-on at radius 0.5 — distance from centre IS facing ratio.
+		float u = (x + 0.5f)/W - 0.5f, v = (y + 0.5f)/H - 0.5f;
+		float r = sqrtf(u*u + v*v)*2.0f;      // 0 centre .. 1 rim
+		float k = (r - 0.55f)/0.45f;
+		if(k < 0.0f) k = 0.0f;
+		if(k > 1.0f) k = 1.0f;
+		*d++ = (u8)(k*k*255.0f);
+	}
+	DCFlushRange(buf, W*H);
+	GX_InitTexObj(&gxRimObj, buf, W, H, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	gxRimReady = 1;
+	gxTexCacheDirty = 1;
+	return &gxRimObj;
+}
+
+static uint32 stStencilEnable = 0;
+static uint32 stStencilFunc = 0;    // rw::StencilFunc, 0 = unset
+static uint32 stStencilPass = STENCILKEEP;
 
 static void gx3DMemoInvalidate(void); // 2D draws stomp the 3D GP state
+static void gx2DMemoInvalidate(void);
 // tracked-render-state appliers (defined with the state block below)
 static void applyBlend(void);
 static void applyCull(void);
@@ -159,6 +271,26 @@ startGX(void)
 		case VI_NTSC:    rmode = &TVNtsc480Prog; break;
 		case VI_EURGB60: rmode = &TVEurgb60Hz480Prog; break;
 		}
+
+	// RESOLUTION pref (menu Graphics row, persisted in dvd:/reVC.INI):
+	// 0 = 480p EFB. 1 and 2 = 640x528 EFB — the hardware maximum for the
+	// RGBA6_Z24 format — downsampled to the fixed 480-line output by the
+	// display copy's YScale below, through the copy filter: real vertical
+	// supersampling on the console's own wire. Value 2 is labelled "720p
+	// (Dolphin IR)": the GP cannot raster more than 528 lines, so anything
+	// higher is Dolphin's internal-resolution scaler, not this code — the
+	// EFB still runs at its 528 maximum so Dolphin has the best base.
+	// Read here, not from the settings loader: the video mode is committed
+	// long before LoadSettings runs, and the fs is already mounted (the
+	// skeleton mounts before RW starts). Absent file or key = 480p.
+	//
+	// MEASURED DEAD END, do not re-try naively: growing efbHeight to 528 and
+	// letting the existing DispCopyYScale (480/528 = 0.909) "downsample"
+	// produced a solid magenta frame — GX_SetDispCopyYScale only scales UP
+	// (it exists for interlace line-doubling); the EFB->XFB copy cannot
+	// vertically downsample. Until a real path exists (PAL 576 modes, or a
+	// texture-copy resample pass), the 528/720 menu entries change nothing.
+	gxReadEfbPref();
 
 	// Reported by the heartbeat rather than printed here: this runs before the
 	// SD is mounted and before Dolphin's Gecko listener attaches, so a printf
@@ -212,7 +344,17 @@ startGX(void)
 	// was measured and changed nothing (the EFB->XFB copy is not where the
 	// frame goes), so there is no reason to pay for it in Z precision.
 	// The radar's round mask is a Z trick, so no destination alpha needed.
-	GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+	// RGBA6, not RGB8: the two bits per channel buy a destination-alpha
+	// channel, which is this hardware's stencil. MBlur's screen effects
+	// (heat haze, water drops on the lens) mask their refraction pass with
+	// STENCILEQUAL; with no stencil on GX those either draw unmasked over
+	// the whole rectangle or not at all. Dest-alpha blending
+	// (GX_BL_DSTALPHA) gives the same masking, and RGBA6 is what most
+	// retail GC titles shipped in for exactly this reason.
+	GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+	// EFB alpha must start each frame at 0 and stay 0 outside mask writes —
+	// see the STENCIL emulation in setRenderState.
+	GX_SetAlphaUpdate(GX_FALSE);
 	GX_SetCullMode(GX_CULL_NONE);
 	GX_CopyDisp(xfb[currentXfb], GX_TRUE);
 	GX_SetDispCopyGamma(GX_GM_1_0);
@@ -243,6 +385,46 @@ static bool32 gx2DProjLoaded;
 static bool32 gx2DMemoDirty = 1;
 static bool32 m2Tex, m2VA, m2Src, m2Dst, m2ZT, m2ZW, m2AF, m2AR;
 
+// One-shot TEV override for the next textured im2D draws:
+//   out = tex*mult + add   (per channel)
+// This is the contrast curve of the MOBILE colour filter, which is a pixel
+// shader everywhere else. Armed by CPostFX through setIm2DConstMulAdd, cleared
+// by clearIm2DOverride; while armed the textured 2D path swaps its MODULATE
+// stage for a two-stage constant multiply-add:
+//   stage0: PREV = TEXC * K0            (K0 = mult/2, scale x2 -> mult<=2)
+//   stage1: PREV = PREV + K1 - 0.5      (K1 = add+0.5, so add may be negative)
+static bool32 gxIm2DMulAdd;
+static GXColor gxIm2DK0, gxIm2DK1;
+
+static u8
+gxQuant255(float v)
+{
+	int i = (int)(v*255.0f + 0.5f);
+	return (u8)(i < 0 ? 0 : i > 255 ? 255 : i);
+}
+
+void
+setIm2DConstMulAdd(const float *mult, const float *add)
+{
+	gxIm2DK0.r = gxQuant255(mult[0]*0.5f);
+	gxIm2DK0.g = gxQuant255(mult[1]*0.5f);
+	gxIm2DK0.b = gxQuant255(mult[2]*0.5f);
+	gxIm2DK0.a = 255;
+	gxIm2DK1.r = gxQuant255(add[0]+0.5f);
+	gxIm2DK1.g = gxQuant255(add[1]+0.5f);
+	gxIm2DK1.b = gxQuant255(add[2]+0.5f);
+	gxIm2DK1.a = 255;
+	gxIm2DMulAdd = 1;
+	gx2DMemoInvalidate();
+}
+
+void
+clearIm2DOverride(void)
+{
+	gxIm2DMulAdd = 0;
+	gx2DMemoInvalidate();
+}
+
 static void
 setupIm2DVtxDesc(bool32 textured)
 {
@@ -256,9 +438,37 @@ setupIm2DVtxDesc(bool32 textured)
 		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
 		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 		GX_SetNumTexGens(1);
-		GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+		if(gxIm2DMulAdd){
+			GX_SetTevKColor(GX_KCOLOR0, gxIm2DK0);
+			GX_SetTevKColor(GX_KCOLOR1, gxIm2DK1);
+			// stage0: lerp(0, tex, K0) x2 = tex*mult
+			GX_SetTevKColorSel(GX_TEVSTAGE0, GX_TEV_KCSEL_K0);
+			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+			GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_TEXC,
+			    GX_CC_KONST, GX_CC_ZERO);
+			GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO,
+			    GX_CS_SCALE_2, GX_TRUE, GX_TEVPREV);
+			GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO,
+			    GX_CA_ZERO, GX_CA_TEXA);
+			GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO,
+			    GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+			// stage1: PREV + K1 - 0.5 = PREV + add
+			GX_SetTevKColorSel(GX_TEVSTAGE1, GX_TEV_KCSEL_K1);
+			GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORDNULL, GX_TEXMAP_NULL,
+			    GX_COLOR0A0);
+			GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_KONST,
+			    GX_CC_ONE, GX_CC_CPREV);
+			GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_SUBHALF,
+			    GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+			GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO,
+			    GX_CA_ZERO, GX_CA_APREV);
+			GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO,
+			    GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		}else{
+			GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+		}
 	}else{
 		GX_SetNumTexGens(0);
 		GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
@@ -266,8 +476,11 @@ setupIm2DVtxDesc(bool32 textured)
 		    GX_COLOR0A0);
 	}
 	// the 3D path runs up to 3 TEV stages and reorders them — a stale
-	// stage count turns every full-screen 2D overlay white (the flashbang)
-	GX_SetNumTevStages(1);
+	// stage count turns every full-screen 2D overlay white (the flashbang).
+	// Two stages while the constant mult-add override is armed, one otherwise
+	// — and no early return above, so the blend/Z/alpha appliers at the end
+	// of this function always run.
+	GX_SetNumTevStages(textured && gxIm2DMulAdd ? 2 : 1);
 	GX_SetNumChans(1);
 	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX,
 	    GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
@@ -279,6 +492,7 @@ setupIm2DVtxDesc(bool32 textured)
 	// occlusion inverts — sky punches through walls and peds).
 	// ponytail: costs the round radar mask (draws square); revisit with a
 	// per-draw Z override once the 2D passes are audited.
+	stMaterialAlpha = 0;   // no material in the 2D path; do not inherit one
 	applyBlend();
 	applyZMode();
 	applyAlphaTest();
@@ -338,6 +552,20 @@ loadWorldMtx(Matrix *world, bool32 withNormals = 0)
 		guMtxInvXpose(mv, nrm);
 		GX_LoadNrmMtxImm(nrm, GX_PNMTX0);
 	}
+	// Spheremap matrix for the env/rim texgen: model-space normal through the
+	// modelview rotation, scaled and biased into 0..1 UVs. Eight floats per
+	// draw, loaded unconditionally so an armed mesh can never miss it.
+	{
+		Mtx tm;
+		for(int j = 0; j < 4; j++){
+			tm[0][j] = 0.5f*mv[0][j];
+			tm[1][j] = -0.5f*mv[1][j];
+			tm[2][j] = 0.0f;
+		}
+		tm[0][3] = 0.5f;
+		tm[1][3] = 0.5f;
+		GX_LoadTexMtxImm(tm, GX_TEXMTX0, GX_MTX2x4);
+	}
 	GX_SetCurrentMtx(GX_PNMTX0);
 }
 
@@ -375,11 +603,18 @@ beginUpdate(Camera *cam)
 		gxHaveCamera = FALSE;
 		return;
 	}
-	// NO unconditional GX_InvalidateTexAll() here. It throws away every
-	// cached texture once per frame; the draw paths already invalidate
-	// exactly when gxraster rebuilds one (gxTexCacheDirty). Emulators
-	// re-decode the whole texture set on each invalidate, so the blanket
-	// version dominated the frame.
+	// Texture-cache invalidation happens HERE, at frame start, and nowhere
+	// else. The draw-site version ("invalidate exactly when a texture was
+	// rebuilt") ran in the MIDDLE of the frame — and on Dolphin an
+	// InvalidateTexAll also drops the virtualised EFB copies, so everything
+	// sampling the captured frame after that point (the colour-filter
+	// overlay, the screen droplets) read black for the rest of that frame.
+	// With rain on and textures streaming in, that was most frames: the
+	// whole world strobing dark, dark "cut" drops — one cause, reported
+	// three ways. A texture rebuilt mid-frame now draws through possibly
+	// stale TMEM until next frame; one frame of stale texels on a brand-new
+	// texture is invisible, a dropped EFB copy is not.
+	if(gxTexCacheDirty){ GX_InvalidateTexAll(); gxTexCacheDirty = 0; }
 	GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
 	GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
 
@@ -434,7 +669,10 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 		clearColor.r = col->red;
 		clearColor.g = col->green;
 		clearColor.b = col->blue;
-		clearColor.a = col->alpha;
+		// Alpha 0 regardless of the requested clear: EFB alpha is the
+		// stencil substitute, and a frame that starts with it at 255 makes
+		// every STENCILEQUAL-masked pass cover its whole rectangle.
+		clearColor.a = 0;
 		GX_SetCopyClear(clearColor, GX_MAX_Z24);
 	}
 }
@@ -524,6 +762,9 @@ showRaster(Raster *raster, uint32 flags)
 	// quantised the frame rate: a 17ms frame missed one retrace and presented
 	// at the next, so the game could only ever read 60 or 30 and nothing
 	// between. Without the stall the rate floats and the frame limiter caps it.
+	// ANTI ALIASING: vertical smoothing in the copy pipeline, on or off.
+	GX_SetCopyFilter(GX_FALSE, nil, gxCopyFilterLevel > 0 ? GX_TRUE : GX_FALSE,
+	    rmode->vfilter);
 	{
 		void *shown = VIDEO_GetCurrentFramebuffer();
 		int next = currentXfb ^ 1;
@@ -594,9 +835,36 @@ showRaster(Raster *raster, uint32 flags)
 }
 
 static bool32
-rasterRenderFast(Raster*, int32, int32)
+rasterRenderFast(Raster *raster, int32 x, int32 y)
 {
-	return 0;
+	// "Copy the camera raster into the raster on the context stack" — the one
+	// shape the game ever uses this in (CPostFX::GetBackBuffer and the
+	// front-buffer capture in postfx/MBlur). The stub that used to be here
+	// returned 0, so every camera-texture in the game held zeros and the
+	// COLOUR FILTER, MOTION BLUR and TRAILS options all did nothing at all.
+	//
+	// The EFB is copied out by the GP (GX_CopyTex), not read by the CPU:
+	// same mechanism showRaster already uses for the XFB, and the copy
+	// registers are re-written by GX_CopyDisp each present, so nothing here
+	// leaks into the display copy.
+	(void)x; (void)y;
+	Raster *dst = Raster::getCurrentContext();
+	if(raster == nil || dst == nil || dst == raster)
+		return 0;
+	if((dst->type & 0xF) != Raster::CAMERATEXTURE)
+		return 0;
+	int32 w = dst->width > rmode->fbWidth ? rmode->fbWidth : dst->width;
+	int32 h = dst->height > rmode->efbHeight ? rmode->efbHeight : dst->height;
+	if(w <= 0 || h <= 0)
+		return 0;
+	// The raster-side work lives in gxraster.cpp, where GxRaster is visible.
+	// No deflicker on a texture grab; the display copy shares the filter
+	// state, so the mode's own filter goes back right after.
+	extern bool32 gxGrabEFB(Raster*, int32, int32);
+	GX_SetCopyFilter(GX_FALSE, nil, GX_FALSE, nil);
+	bool32 ok = gxGrabEFB(dst, w, h);
+	GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+	return ok;
 }
 
 // im2D texture, set by the game through rwRENDERSTATETEXTURERASTER.
@@ -625,9 +893,20 @@ gxBlend(uint32 blend)
 static void
 applyBlend(void)
 {
+	// The stencil emulation outranks the plain blend state: a masked pass
+	// must blend by destination alpha whatever src/dst the game set, and a
+	// mask-writing pass must be allowed to write EFB alpha.
+	if(stStencilEnable && stStencilFunc == STENCILEQUAL){
+		GX_SetAlphaUpdate(GX_FALSE);
+		GX_SetBlendMode(GX_BM_BLEND, GX_BL_DSTALPHA, GX_BL_INVDSTALPHA,
+		    GX_LO_CLEAR);
+		return;
+	}
+	GX_SetAlphaUpdate(stStencilEnable && stStencilPass == STENCILREPLACE ?
+	    GX_TRUE : GX_FALSE);
 	// vertexAlpha OR textureAlpha, matching gl3 and d3d9. Testing only
 	// vertexAlpha here is what made alpha-textured effects draw opaque.
-	if(stVertexAlpha || stTextureAlpha)
+	if(stVertexAlpha || stTextureAlpha || stMaterialAlpha)
 		GX_SetBlendMode(GX_BM_BLEND, gxBlend(stSrcBlend),
 		    gxBlend(stDstBlend), GX_LO_CLEAR);
 	else
@@ -733,6 +1012,31 @@ setRenderState(int32 state, void *pvalue)
 		stVertexAlpha = value;
 		if(gxStarted) applyBlend();
 		break;
+	case STENCILENABLE:
+		stStencilEnable = value;
+		if(!value){
+			stStencilFunc = 0;
+			stStencilPass = STENCILKEEP;
+		}
+		if(gxStarted) applyBlend();
+		break;
+	case STENCILFUNCTION:
+		stStencilFunc = value;
+		if(gxStarted) applyBlend();
+		break;
+	case STENCILPASS:
+		stStencilPass = value;
+		if(gxStarted) applyBlend();
+		break;
+	case STENCILFAIL:
+	case STENCILZFAIL:
+	case STENCILFUNCTIONREF:
+	case STENCILFUNCTIONMASK:
+	case STENCILFUNCTIONWRITEMASK:
+		// Accepted so the game's stencil setup is not an error; the
+		// dest-alpha emulation has no use for them (ref is always 1,
+		// masks always full).
+		break;
 	case SRCBLEND:
 		stSrcBlend = value;
 		if(gxStarted) applyBlend();
@@ -798,15 +1102,64 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 
 	stTexOpaque = 0; // 2D never takes the early-Z fast path
 	GXTexObj *tex = gxGetTexture(currentTexRaster);
-	if(gxTexCacheDirty){
-		GX_InvalidateTexAll();
-		gxTexCacheDirty = 0;
-	}
 	if(tex)
 		GX_LoadTexObj(tex, GX_TEXMAP0);
 
 	setupIm2DVtxDesc(tex != nil);
 	setIm2DMatrices();
+
+	// Blend truth at draw time, additive draws only (rain family). One line
+	// per state change, bounded — gecko drops floods.
+	{
+		extern bool32 gxForceAddBlend;
+		static uint32 lastKey = ~0u;
+		static int32 left = 40;
+		uint32 key = (stVertexAlpha<<16) | (stSrcBlend<<8) | stDstBlend;
+		if(stSrcBlend == BLENDONE && stDstBlend == BLENDONE &&
+		   key != lastKey && left-- > 0){
+			lastKey = key;
+			char bl[64];
+			snprintf(bl, sizeof(bl), "IM2D va=%u src=%u dst=%u ta=%u",
+			    (unsigned)stVertexAlpha, (unsigned)stSrcBlend,
+			    (unsigned)stDstBlend, (unsigned)stTextureAlpha);
+			GeckoLog(bl);
+		}
+		if(gxForceAddBlend && stSrcBlend == BLENDONE && stDstBlend == BLENDONE)
+			GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
+	}
+
+	// Corner-artifact hunter: any small quad landing in the top-left region
+	// names itself — texture, size, blend, alpha. Bounded; card-logged so
+	// gecko drops cost nothing.
+	if(count <= 8){
+		float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+		for(int32 i = 0; i < count; i++){
+			Im2DVertex *v = &verts[indices ? idx[i] : i];
+			if(v->x < minx) minx = v->x;
+			if(v->x > maxx) maxx = v->x;
+			if(v->y < miny) miny = v->y;
+			if(v->y > maxy) maxy = v->y;
+		}
+		if(minx < 200.0f && miny < 200.0f && maxx - minx > 32.0f &&
+		   maxx - minx < 340.0f && maxy - miny > 32.0f && maxy - miny < 340.0f &&
+		   maxx < 460.0f && maxy < 380.0f){
+			static int32 left = 30;
+			if(left-- > 0){
+				char cl[128];
+				snprintf(cl, sizeof(cl),
+				    "CORNER %.0f,%.0f-%.0f,%.0f tex=%p %dx%d va=%u s%u d%u a=%u\n",
+				    minx, miny, maxx, maxy, (void*)currentTexRaster,
+				    currentTexRaster ? currentTexRaster->width : 0,
+				    currentTexRaster ? currentTexRaster->height : 0,
+				    (unsigned)stVertexAlpha, (unsigned)stSrcBlend,
+				    (unsigned)stDstBlend,
+				    (unsigned)verts[indices ? idx[0] : 0].a);
+				DVD_FS_GUARD;
+				FILE *cf = fopen("dvd:/automenu.log", "a");
+				if(cf){ fputs(cl, cf); fclose(cf); }
+			}
+		}
+	}
 
 	gxLastPath = "2d";
 	gxLast.path = "2d";
@@ -896,6 +1249,10 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	bool32 sendColor, bool32 indexed = 0, RGBA ambAdd = {0,0,0,0},
 	u8 posFrac = 0xFF, u8 uvFrac = 0xFF)
 {
+	// stMaterialAlpha is set by the CALLER from the real material — the
+	// atomic path bakes the material colour into the vertex stream and hands
+	// this function white, which is how the first version of this flag
+	// managed to never fire and left the mission markers opaque anyway.
 	// posFrac/uvFrac: 0xFF means the attribute is float32, anything else is the
 	// binary shift of a gxPackGeometry-quantised int16 array. The shift is part
 	// of the vertex format, so it MUST be part of the memo key — two geometries
@@ -915,6 +1272,9 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	static bool32 mTexOpaque;
 	static bool32 mSend;
 	static u8 mPosFrac = 0xFF, mUvFrac = 0xFF;
+	static void *mEnvTex;
+	static u32 mEnvK32;
+	u32 envK32 = ((u32)gxEnvK.r<<24)|((u32)gxEnvK.g<<16)|((u32)gxEnvK.b<<8)|gxEnvK.a;
 	RGBAf ambl = ambLight ? *ambLight : (RGBAf){0,0,0,0};
 	if(!gx3DMemoDirty && mT == textured && mL == lit && mP == prelit &&
 	   mN == haveNormals && mMask == lightMask && mAmb == surfAmb &&
@@ -923,7 +1283,8 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	   *(uint32*)&mAmbAdd == *(uint32*)&ambAdd &&
 	   *(uint32*)&mMat == *(uint32*)&matcol &&
 	   mAmbL.red == ambl.red && mAmbL.green == ambl.green &&
-	   mAmbL.blue == ambl.blue){
+	   mAmbL.blue == ambl.blue &&
+	   mEnvTex == (void*)gxEnvTex && mEnvK32 == envK32){
 		applyBlend();
 		applyZMode();
 		applyAlphaTest();
@@ -934,6 +1295,7 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	gx2DMemoInvalidate();
 	mT = textured; mL = lit; mP = prelit; mN = haveNormals;
 	mMask = lightMask; mAmb = surfAmb; mMat = matcol; mAmbL = ambl;
+	mEnvTex = (void*)gxEnvTex; mEnvK32 = envK32;
 	mIdx = indexed; mAmbAdd = ambAdd; mTexOpaque = stTexOpaque;
 	mSend = sendColor;
 	mPosFrac = posFrac; mUvFrac = uvFrac;
@@ -946,9 +1308,19 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	else
 		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_S16, posFrac);
 	bool32 hwLights = lit && haveNormals && lightMask != GX_LIGHTNULL;
-	if(hwLights){
+	bool32 envOn = gxEnvTex != nil && !gxEnvUV2;
+	bool32 dualOn = gxEnvTex != nil && gxEnvUV2;
+	// Normals go to the GP for hardware lights OR for the env/rim texgen —
+	// the emission loops in atomicRenderCB use the same predicate, and the
+	// two disagreeing is a FIFO desync. The lightmap stage sends UV set 1
+	// instead; the two are never armed together.
+	if(hwLights || envOn){
 		GX_SetVtxDesc(GX_VA_NRM, attrMode);
 		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+	}
+	if(dualOn){
+		GX_SetVtxDesc(GX_VA_TEX1, attrMode);
+		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
 	}
 	// vertex colors whenever the channel reads them. Decided by the caller
 	// (see atomicRenderCB) so the vertex descriptor here and the vertex
@@ -1016,10 +1388,20 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 			GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 		else
 			GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_S16, uvFrac);
-		GX_SetNumTexGens(1);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-	}else
-		GX_SetNumTexGens(0);
+	}
+	{
+		u8 ntg = textured ? 1 : 0;
+		if(envOn)
+			GX_SetTexCoordGen(textured ? GX_TEXCOORD1 : GX_TEXCOORD0,
+			    GX_TG_MTX2x4, GX_TG_NRM, GX_TEXMTX0);
+		else if(dualOn)
+			GX_SetTexCoordGen(textured ? GX_TEXCOORD1 : GX_TEXCOORD0,
+			    GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+		if(envOn || dualOn)
+			ntg++;
+		GX_SetNumTexGens(ntg);
+	}
 
 	bool32 prelitLit = hwLights && prelit;
 	if(prelitLit){
@@ -1078,6 +1460,26 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 		    GX_TRUE, GX_TEVPREV);
 		stage++;
 	}
+	// The armed extra stage: PREV += envTex * K2. The texture arrives
+	// through the spheremap texgen, so this is the matfx environment
+	// reflection on vehicles and the rim term on peds, both on the GP.
+	if(envOn || dualOn){
+		u8 envMap = textured ? GX_TEXMAP1 : GX_TEXMAP0;
+		u8 envCoord = textured ? GX_TEXCOORD1 : GX_TEXCOORD0;
+		GX_LoadTexObj(gxEnvTex, envMap);
+		GX_SetTevKColor(GX_KCOLOR2, gxEnvK);
+		GX_SetTevKColorSel(stage, GX_TEV_KCSEL_K2);
+		GX_SetTevOrder(stage, envCoord, envMap, GX_COLORNULL);
+		GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_KONST,
+		    GX_CC_CPREV);
+		GX_SetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO,
+		    GX_CA_APREV);
+		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
+		    GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
+		    GX_TRUE, GX_TEVPREV);
+		stage++;
+	}
 	GX_SetNumTevStages(stage - GX_TEVSTAGE0);
 
 	applyBlend();
@@ -1087,11 +1489,145 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	GX_LoadProjectionMtx(gxProj, gxProjType);
 }
 
+// ---- screen droplets: the neo lens-drop shader, as two TEV stages --------
+//
+// The PC build combines a drop-shape mask (TEX0) with the captured frame
+// sampled through a second UV set (TEX1) in a pixel shader. The TEV does the
+// same combine in hardware: PREV.rgb = screen texel, PREV.a = mask alpha *
+// vertex alpha, standard alpha blend. Called by screendroplets.cpp, which
+// owns the drop simulation; this owns only the draw.
+static GXTexObj *gxDropMask, *gxDropScreen;
+// Global namespace on purpose: set from game code (screendroplets.cpp) via a
+// plain extern, no rw::gx include dance. Red = mask shape/alpha isolated.
+bool32 gxScreenDropDebugRed;
+bool32 gxScreenDropDebugMask;
+static uint32 gxDropSaved[6];
+// Additive glint for the MBlur water/blood drops (0 = plain modulate, the
+// rain lens-drops). Set before gxDropletBegin, cleared by gxDropletEnd.
+uint8 gxDropletBrighten;
+bool32 gxForceAddBlend;   // dvd:/autoblend.txt: force ONE/ONE on additive im2D
+uint32 gxDropQuads;      // quads actually drawn this frame
+int32 gxDropBeginState;  // 1 ok, -1 mask nil, -2 screen nil, 0 never ran
+
+GXTexObj *gxGetTexture(Raster*);
+
+void
+gxDropletBegin(Raster *mask, Raster *screen)
+{
+	// ponytail: drawn through the exact im2D setup the HUD uses every frame,
+	// with the mask as the one texture — the bespoke two-texture TEV path
+	// missampled the mask (flat squares) and refraction is parked until that
+	// is understood. Soft translucent drops, correct shape, no refraction.
+	gxDropMask = mask ? gxGetTexture(mask) : nil;
+	gxDropScreen = screen ? gxGetTexture(screen) : nil;
+	gxDropBeginState = gxDropMask == nil ? -1 : gxDropScreen == nil ? -2 : 1;
+	if(gxDropMask == nil)
+		return;
+	// The droplet pass owns its blend/Z; save the tracked state and restore
+	// in End so the next draw's appliers see what the game actually set.
+	gxDropSaved[0] = stVertexAlpha; gxDropSaved[1] = stSrcBlend;
+	gxDropSaved[2] = stDstBlend;    gxDropSaved[3] = stZTest;
+	gxDropSaved[4] = stZWrite;      gxDropSaved[5] = stStencilEnable;
+	stVertexAlpha = 1;
+	stSrcBlend = BLENDSRCALPHA;
+	stDstBlend = BLENDINVSRCALPHA;
+	stZTest = 0;
+	stZWrite = 0;
+	// The MBlur fx loop runs with the stencil emulation armed; left on, the
+	// blend applier switches to the dest-alpha override and paints the whole
+	// quad opaque — the corner square. Droplets blend by their own alpha.
+	stStencilEnable = 0;
+	GX_LoadTexObj(gxDropMask, GX_TEXMAP0);
+	setupIm2DVtxDesc(1);
+	setIm2DMatrices();
+	GX_SetCullMode(GX_CULL_NONE);
+	// The original screenDroplet shader is vtxColor x mask x SCREEN — the
+	// refraction is the screen texture sampled over a magnified span. Added
+	// on top of the proven im2D base one stage at a time: stage0 stays the
+	// im2D modulate (vtx x mask), stage1 multiplies the grabbed frame in.
+	if(gxDropScreen){
+		GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
+		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+		GX_SetNumTexGens(2);
+		GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+		GX_LoadTexObj(gxDropScreen, GX_TEXMAP1);
+		GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD1, GX_TEXMAP1, GX_COLORNULL);
+		GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_TEXC, GX_CC_CPREV, GX_CC_ZERO);
+		// screen alpha stays out of the product: the EFB copy is RGB565 —
+		// its "alpha" is undefined, and the PC backbuffer reads 255 here.
+		GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+		GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
+		    GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
+		    GX_TRUE, GX_TEVPREV);
+		if(gxDropletBrighten){
+			// PREV + K2: the pass-1 gray glint of the PC water drop, which
+			// is what keeps the refracted patch from reading as a dark spot
+			// over dark scenery.
+			GXColor k = { gxDropletBrighten, gxDropletBrighten,
+			              gxDropletBrighten, 255 };
+			GX_SetTevKColor(GX_KCOLOR2, k);
+			GX_SetTevKColorSel(GX_TEVSTAGE2, GX_TEV_KCSEL_K2);
+			GX_SetTevOrder(GX_TEVSTAGE2, GX_TEXCOORDNULL, GX_TEXMAP_NULL,
+			    GX_COLORNULL);
+			GX_SetTevColorIn(GX_TEVSTAGE2, GX_CC_KONST, GX_CC_ZERO,
+			    GX_CC_ZERO, GX_CC_CPREV);
+			GX_SetTevAlphaIn(GX_TEVSTAGE2, GX_CA_ZERO, GX_CA_ZERO,
+			    GX_CA_ZERO, GX_CA_APREV);
+			GX_SetTevColorOp(GX_TEVSTAGE2, GX_TEV_ADD, GX_TB_ZERO,
+			    GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+			GX_SetTevAlphaOp(GX_TEVSTAGE2, GX_TEV_ADD, GX_TB_ZERO,
+			    GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+			GX_SetNumTevStages(3);
+		}else
+		GX_SetNumTevStages(2);
+	}
+}
+
+void
+gxDropletQuad(const float *px, const float *py, float u2l, float v2t,
+    float u2r, float v2b, uint32 rgba)
+{
+	if(gxDropMask == nil)
+		return;
+	static const float mu[4]  = { 0.0f, 0.0f, 1.0f, 1.0f };
+	static const float mv2[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
+	gxDropQuads++;
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+	for(int i = 0; i < 4; i++){
+		GX_Position3f32(px[i], py[i], 0.0f);
+		GX_Color4u8((u8)(rgba>>24), (u8)(rgba>>16), (u8)(rgba>>8), (u8)rgba);
+		GX_TexCoord2f32(mu[i], mv2[i]);
+		if(gxDropScreen)
+			// Corner order: i0/i3 are the TOP of the quad. The GX grab is
+			// top-down, so top maps to vt (the PC table's flip undoes GL's
+			// bottom-up storage and must not be copied here).
+			GX_TexCoord2f32(i < 2 ? u2l : u2r, (i == 0 || i == 3) ? v2t : v2b);
+	}
+	GX_End();
+}
+
+void
+gxDropletEnd(void)
+{
+	if(gxDropMask){
+		stVertexAlpha = gxDropSaved[0]; stSrcBlend = gxDropSaved[1];
+		stDstBlend = gxDropSaved[2];    stZTest = gxDropSaved[3];
+		stZWrite = gxDropSaved[4];      stStencilEnable = gxDropSaved[5];
+	}
+	gxDropMask = gxDropScreen = nil;
+	gxDropletBrighten = 0;
+	// Whatever draws next rebuilds its own state.
+	gx3DMemoInvalidate();
+	gx2DMemoInvalidate();
+}
+
 // Compatibility wrapper for the im3D path: untextured/unlit semantics.
 static void
 setup3DVtxDesc(bool32 textured)
 {
 	// im3D always streams a per-vertex color
+	gxEnvTex = nil;
 	setup3DDraw(textured, 0, 0, 0, makeRGBA(255,255,255,255), 1.0f, nil,
 	    GX_LIGHTNULL, 1);
 }
@@ -1248,11 +1784,20 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	const int16 *packUV = (gpk->packed & GXPACK_UV) ? gpk->uv : nil;
 	u8 posFrac = packPos ? gpk->posShift : 0xFF;
 	u8 uvFrac = packUV ? gpk->uvShift : 0xFF;
+	// Both sides nil happens when a pack ran out of memory after freeing the
+	// floats; feeding GX a null array crashed the GC build (nil+0x14 read in
+	// this function). Skip the atomic and say so once.
+	if(geo->morphTargets[0].vertices == nil && packPos == nil){
+		static bool32 said;
+		if(!said){ said = 1; GeckoLog("GXNILGEO"); }
+		return;
+	}
 
 	V3d *verts = geo->morphTargets[0].vertices;
 	if(verts == nil && packPos == nil)
 		return;
 	TexCoords *uv = geo->numTexCoordSets > 0 ? geo->texCoords[0] : nil;
+	TexCoords *uv2 = geo->numTexCoordSets > 1 ? geo->texCoords[1] : nil;
 	RGBA *prelit = (geo->flags & Geometry::PRELIT) ? geo->colors : nil;
 	V3d *normals = geo->morphTargets[0].normals;
 
@@ -1429,6 +1974,11 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		if(needFlush)
 			DCFlushRange(normals, geo->numVertices*sizeof(V3d));
 	}
+	if(uv2){
+		GX_SetArray(GX_VA_TEX1, uv2, sizeof(TexCoords));
+		if(needFlush)
+			DCFlushRange(uv2, geo->numVertices*sizeof(TexCoords));
+	}
 	if(prelit){
 		GX_SetArray(GX_VA_CLR0, prelit, sizeof(RGBA));
 		if(needFlush)
@@ -1489,11 +2039,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// 3D path never did, which is why freshly streamed characters showed
 		// the wrong part of their atlas (shirt texels on hands and feet) while
 		// their UVs measured correct.
-		if(gxTexCacheDirty){
-			GX_InvalidateTexAll();
-			gxTexCacheDirty = 0;
-		}
-		if(tex){
+			if(tex){
 			// world UVs repeat far past 0..1; the raster-level default is
 			// CLAMP, which smears the edge texel across every near mesh.
 			// (GX wrap needs pow2 dims — true for VC's textures.)
@@ -1655,6 +2201,81 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		       ambR8, ambG8, ambB8, matcol))
 			useIdx = 1;
 #endif
+		// Arm the env/rim stage for this mesh. Only when the geometry still
+		// owns float normals: packed world geometry freed its float arrays
+		// and never had normals to begin with, and the descriptor/emission
+		// pair below must agree with setup3DDraw about GX_VA_NRM.
+		// The blend trigger the other backends compute per mesh
+		// (inst->vertexAlpha || m->color.alpha != 255). The material colour
+		// is baked into the vertex colours on this path, so the flag is the
+		// only surviving record that this mesh is translucent — the pink
+		// mission marker (zonecylb.dff, RpMaterialSetColor alpha) is the
+		// visible case.
+		stMaterialAlpha = mat != nil && mat->color.alpha != 255;
+		gxEnvTex = nil;
+		gxEnvUV2 = 0;
+		MatFX *mfx = mat ? MatFX::get(mat) : nil;
+		if(normals && !packPos){
+			if(mfx && (mfx->type == MatFX::ENVMAP ||
+			           mfx->type == MatFX::BUMPENVMAP)){
+				Texture *envt = mfx->getEnvTexture();
+				float ec = mfx->getEnvCoefficient();
+				if(envt && envt->raster && ec > 0.02f){
+					GXTexObj *eo = gxGetTexture(envt->raster);
+					if(eo){
+						u8 e8 = ec >= 1.0f ? 255 : (u8)(ec*255.0f);
+						gxEnvTex = eo;
+						gxEnvK = (GXColor){ e8, e8, e8, 255 };
+					}
+				}
+			}
+			// ROAD GLOSS: the neo gloss texture for this material, spheremapped
+			// by the vertex normal — view-dependent shine, additive. Same
+			// constraint as the PC pipe: no normals, no gloss.
+			if(gxEnvTex == nil && gxGlossEnable && gxGlossLookup && mat && mat->texture){
+				Texture *gt = gxGlossLookup(mat);
+				if(gt && gt->raster){
+					GXTexObj *go = gxGetTexture(gt->raster);
+					if(go){
+						float gm = gxGlossMult;
+						if(gm > 1.0f) gm = 1.0f;
+						if(gm < 0.0f) gm = 0.0f;
+						u8 g8 = (u8)(gm*255.0f);
+						gxEnvTex = go;
+						gxEnvK = (GXColor){ g8, g8, g8, 255 };
+					}
+				}
+			}
+			if(gxEnvTex == nil && gxRimEnable && skinnedAtomic){
+				// Bind-pose normals on an animated ped make the rim swim a
+				// little; a soft cool rim reads right regardless.
+				GXTexObj *ro = gxRimRamp();
+				if(ro){
+					gxEnvTex = ro;
+					gxEnvK = (GXColor){ 90, 110, 140, 255 };
+				}
+			}
+		}
+		// WORLD LIGHTMAPS: dual-pass matfx texture through UV set 1, scaled
+		// by the time-of-day blend the game interpolates from the neo table.
+		if(gxEnvTex == nil && gxLightmapEnable && uv2 && mfx &&
+		   mfx->type == MatFX::DUAL){
+			Texture *dt = mfx->getDualTexture();
+			if(dt && dt->raster){
+				GXTexObj *dob = gxGetTexture(dt->raster);
+				float lb = gxLightmapBlend;
+				if(lb > 1.0f) lb = 1.0f;
+				if(lb < 0.0f) lb = 0.0f;
+				u8 l8 = (u8)(lb*255.0f);
+				if(dob && l8 > 2){
+					gxEnvTex = dob;
+					gxEnvUV2 = 1;
+					gxEnvK = (GXColor){ l8, l8, l8, 255 };
+				}
+			}
+		}
+		bool32 sendNrm = gxEnvTex != nil && !gxEnvUV2;
+		bool32 sendUV2 = gxEnvTex != nil && gxEnvUV2;
 		setup3DDraw(tex != nil, 0, 1, 0,
 		    makeRGBA(255, 255, 255, 255), 1.0f, nil, GX_LIGHTNULL,
 		    sendColor, useIdx, ambK, posFrac, uvFrac);
@@ -1663,6 +2284,13 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 			GX_SetArray(GX_VA_CLR0, gpk->colors, sizeof(RGBA));
 			if(tex)
 				GX_SetArray(GX_VA_TEX0, (void*)packUV, 2*sizeof(int16));
+			// The GP's vertex cache is keyed by INDEX. Rebinding the arrays
+			// does not clear it, so without this the next mesh's index 5 can
+			// fetch the PREVIOUS mesh's vertex 5 straight from the cache —
+			// chunks of one model drawn with another's positions, on screen
+			// as geometry and people teleporting. Reported by the user within
+			// hours of GX_USE_INDEXED going on.
+			GX_InvVtxCache();
 		}
 		if(skinnedAtomic){
 			// Character rigs mirror their left-side bones, so those bone
@@ -1754,10 +2382,12 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 				for(uint32 i = start; i < start + count; i++){
 					uint16 vi = mesh->indices[i];
 					GX_Position1x16(vi);
-					if(hwLights)
+					if(hwLights || sendNrm)
 						GX_Normal1x16(vi);
 					GX_Color1x16(vi);
 					if(tex)
+						GX_TexCoord1x16(vi);
+					if(sendUV2)
 						GX_TexCoord1x16(vi);
 				}
 				GX_End();
@@ -1780,7 +2410,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 				// normals but zero enumerated directionals (night, or a
 				// geometry without the NORMALS flag) would otherwise push an
 				// undeclared attribute and desync the FIFO — garbage geometry.
-				if(hwLights)
+				if(hwLights || sendNrm)
 					GX_Normal3f32(normals[vi].x, normals[vi].y,
 					    normals[vi].z);
 				{
@@ -1820,6 +2450,8 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 							GX_TexCoord2f32(uv ? uv[vi].u : 0.0f,
 							    uv ? uv[vi].v : 0.0f);
 					}
+					if(sendUV2)
+						GX_TexCoord2f32(uv2[vi].u, uv2[vi].v);
 					continue;
 				}
 #endif
@@ -1883,6 +2515,8 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 					else
 						GX_TexCoord2f32(uv ? uv[vi].u : 0.0f,
 						    uv ? uv[vi].v : 0.0f);
+					if(sendUV2)
+						GX_TexCoord2f32(uv2[vi].u, uv2[vi].v);
 				}
 			}
 			GX_End();
@@ -1933,6 +2567,18 @@ deviceSystem(DeviceReq req, void *arg0, int32 n)
 	case DEVICEINIT:
 	case DEVICETERM:
 	case DEVICEFINALIZE:
+		return 1;
+	// The ANTI ALIASING option. Real EFB multisampling is a different pixel
+	// format (RGB565_Z16, field-rendered) and would cost the dest-alpha the
+	// screen effects use, so the togglable level drives the copy-out
+	// smoothing filter instead — the hardware's own edge filter, applied for
+	// free during the EFB->XFB copy.
+	case DEVICEGETMAXMULTISAMPLINGLEVELS:
+		return 2;
+	case DEVICEGETMULTISAMPLINGLEVELS:
+		return gxCopyFilterLevel ? 2 : 1;
+	case DEVICESETMULTISAMPLINGLEVELS:
+		gxCopyFilterLevel = n > 1 ? 1 : 0;
 		return 1;
 
 	case DEVICEGETNUMSUBSYSTEMS:
