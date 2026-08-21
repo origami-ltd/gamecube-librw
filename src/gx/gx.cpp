@@ -162,14 +162,6 @@ gxReadEfbPref(void)
 				gxEfbResPref = (int8)atoi(strchr(prefLn, '=') + 1);
 		fclose(prefF);
 	}
-	{
-		FILE *bl = fopen("dvd:/revc_boot.log", "a");
-		if(bl){
-			fprintf(bl, "efbpref: ini=%s pref=%d\n",
-			    prefF ? "open" : "MISSING", (int)gxEfbResPref);
-			fclose(bl);
-		}
-	}
 	return gxEfbResPref;
 }
 uint32 gxCopyFilterLevel;    // <- m_nPrefsMSAALevel: 0 sharp, >0 smoothing filter

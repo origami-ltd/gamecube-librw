@@ -352,6 +352,16 @@ Texture::read(const char *name, const char *mask)
 		tex->addRef();
 		return tex;
 	}
+#ifdef RW_GAMECUBE
+	// Console assets come from the active TXD.  Falling back to standalone
+	// image files for every absent HUD slot walks the ISO directory once per
+	// registered image format; one missing weapon icon can therefore park the
+	// DVD thread for minutes.  The fallback eventually made the same dummy
+	// texture anyway because retail data has no loose images, so go there
+	// directly whenever a dictionary is active.
+	if(TEXTUREGLOBAL(currentTexDict))
+		goto dummytex;
+#endif
 	if(TEXTUREGLOBAL(loadTextures)){
 		tex = Texture::readCB(name, mask);
 		if(tex == nil)
