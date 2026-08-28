@@ -51,6 +51,8 @@ unsigned gxViTVMode, gxHaveComponent, gxXfbHeight, gxEfbHeight;
 // it rather than allocating a third one. See startGX.
 void *gxAdoptXfb;
 unsigned gxAdoptXfbSize;
+// Second GX-owned XFB, exported for the boot FMV's present queue.
+void *gxMovieXfb;
 // Whether showRaster waits for the retrace. The game pushes m_PrefsVsync down
 // into this; defaults on so a build that never sets it behaves as before.
 unsigned gxWaitRetrace = 1;
@@ -293,15 +295,24 @@ startGX(void)
 	::gxXfbHeight = rmode->xfbHeight;
 	::gxEfbHeight = rmode->efbHeight;
 
-	// Reverted: adopting the boot console's framebuffer here to save 614KB
-	// corrupted the loading screen. That buffer already has console text
-	// written into it, the game does not cover every pixel of every frame, and
-	// the leftovers showed through as red blocks across the picture. The
-	// saving is real and still available, but it needs the buffer cleared at
-	// hand-over and the console redirected before anything else prints — not
-	// worth another broken boot to chase right now.
-	xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+	// Reuse the boot console XFB when the skeleton offers it: linking Theora
+	// leaves the cold-boot texture heap too tight for FONTS.TXD if this 614KB
+	// block is allocated a third time. The earlier attempt showed console
+	// leftovers as red blocks through the picture; clearing every pixel at
+	// hand-over fixes that. Both buffers are cleared — SYS_AllocateFramebuffer
+	// memory is uninitialised, and 0xFF patterns read as bright pink in YUY2
+	// on the first flips before an EFB copy lands.
+	unsigned xfbSize = VIDEO_GetFrameBufferSize(rmode);
+	if(::gxAdoptXfb && ::gxAdoptXfbSize >= xfbSize){
+		xfb[0] = ::gxAdoptXfb;
+		VIDEO_ClearFrameBuffer(rmode, xfb[0], COLOR_BLACK);
+	}else
+		xfb[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 	xfb[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+	VIDEO_ClearFrameBuffer(rmode, xfb[1], COLOR_BLACK);
+	// Second GX-owned XFB, exposed only so the boot FMV can queue one frame
+	// ahead without allocating a third 614KB buffer.
+	::gxMovieXfb = xfb[1];
 	currentXfb = 0;
 
 	VIDEO_Configure(rmode);
