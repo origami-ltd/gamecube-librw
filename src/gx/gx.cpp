@@ -933,11 +933,13 @@ gxOscNote(void *geo, uint16 m, uint16 sig, const char *texname)
 }
 
 static void gxOscDump(void);
+static void gxColorRetireSweep(void);
 
 static void
 gxOscFrameTick(void)
 {
 	gxOscFrame++;
+	gxColorRetireSweep();
 	if(gxOscFrame % 300 == 0 && gxOscLogEnable)
 		gxOscDump();
 }
@@ -1820,6 +1822,34 @@ im3DEnd(void)
 // mesh, so the result only changes when the ambient or the material does —
 // with the time of day, not with the frame.
 //
+// Deferred free for retired colour arrays: the GP may keep reading an old
+// array for up to a frame after the pointer flip, so a retiree waits two
+// frames in this ring before rwFree. Sweep runs once per frame.
+struct GxColorRetiree { void *p; uint32 frame; };
+static GxColorRetiree gxColorRetired[64];
+static void
+gxColorRetire(void *p)
+{
+	if(p == nil)
+		return;
+	for(int32 i = 0; i < 64; i++)
+		if(gxColorRetired[i].p == nil){
+			gxColorRetired[i].p = p;
+			gxColorRetired[i].frame = gxOscFrame;
+			return;
+		}
+	rwFree(p);   // ring full; with ~a handful of rebuilds per frame, unreachable
+}
+static void
+gxColorRetireSweep(void)
+{
+	for(int32 i = 0; i < 64; i++)
+		if(gxColorRetired[i].p && gxOscFrame - gxColorRetired[i].frame >= 2){
+			rwFree(gxColorRetired[i].p);
+			gxColorRetired[i].p = nil;
+		}
+}
+
 // Returns false when the geometry is not a candidate (skinned, lit by
 // directionals, or no prelight), in which case the caller stays immediate.
 static bool32
@@ -1849,23 +1879,30 @@ gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
 	if(g->colors && g->colorCount == n && g->colorKey == key)
 		return 1;
 
-	if(g->colors == nil || g->colorCount != n){
-		rwFree(g->colors);
-		g->colors = (RGBA*)rwMalloc(n*sizeof(RGBA), MEMDUR_EVENT | ID_GEOMETRY);
-		if(g->colors == nil){ g->colorCount = 0; return 0; }
-		g->colorCount = n;
-	}
+	// Publish-then-retire, never rebuild in place: the GP may still be
+	// DMA-reading the OLD array from the previous frame's FIFO (the flush
+	// orders memory, it does not wait for the GP). An in-place rewrite on
+	// an ambient step tore mid-read — intermittent wrong-colour flashes on
+	// exactly the meshes whose ambient moves (the lobby floor at dawn).
+	// The new array is filled and flushed BEFORE the pointer flips; the old
+	// one waits two frames in gxColorRetire before it is freed.
+	RGBA *fresh = (RGBA*)rwMalloc(n*sizeof(RGBA), MEMDUR_EVENT | ID_GEOMETRY);
+	if(fresh == nil)
+		return g->colors != nil && g->colorCount == n;  // stale beats torn
 	for(int32 i = 0; i < n; i++){
 		int r8 = clamp255i(ambR8 + prelit[i].red);
 		int g8 = clamp255i(ambG8 + prelit[i].green);
 		int b8 = clamp255i(ambB8 + prelit[i].blue);
-		g->colors[i].red   = (uint8)mul255(r8, matcol.red);
-		g->colors[i].green = (uint8)mul255(g8, matcol.green);
-		g->colors[i].blue  = (uint8)mul255(b8, matcol.blue);
-		g->colors[i].alpha = (uint8)mul255(prelit[i].alpha, matcol.alpha);
+		fresh[i].red   = (uint8)mul255(r8, matcol.red);
+		fresh[i].green = (uint8)mul255(g8, matcol.green);
+		fresh[i].blue  = (uint8)mul255(b8, matcol.blue);
+		fresh[i].alpha = (uint8)mul255(prelit[i].alpha, matcol.alpha);
 	}
+	DCFlushRange(fresh, n*sizeof(RGBA));
+	gxColorRetire(g->colors);
+	g->colors = fresh;
+	g->colorCount = n;
 	g->colorKey = key;
-	DCFlushRange(g->colors, n*sizeof(RGBA));
 	return 1;
 }
 
