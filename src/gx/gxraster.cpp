@@ -100,6 +100,7 @@ struct GxRaster
 	uint8 gxFmt; // GX_TF_CMPR or GX_TF_RGB5A3, chosen at first build
 	uint32 tiledSize;   // so the free path subtracts exactly what was added
 	bool32 tiledCharged; // whether that size went onto ms_memoryUsed
+	uint16 texFails; // consecutive tiling-alloc failures; gates the draw skip
 };
 
 int32 nativeRasterOffset;
@@ -673,6 +674,8 @@ gxGetTexture(Raster *raster)
 			// the budget was being tuned against was invisible to the readout
 			// used to tune it.
 			::rwTexAllocFails++;
+			if(ext->texFails < 1000)
+				ext->texFails++;
 #if defined(GTA_OGC) && !defined(HW_RVL)
 			// The disc build's boot pin: name this failure and the memory
 			// state on the card, the one debug channel this target has.
@@ -723,6 +726,7 @@ gxGetTexture(Raster *raster)
 	// draining it).
 	gxTexCacheDirty = 1;
 	::gxTexBuilds++;
+	ext->texFails = 0;
 
 	// ponytail: plain textures never re-lock once drawn, and keeping both the
 	// linear staging and the tiled copy doubles texture cost against a 16MB
@@ -733,6 +737,24 @@ gxGetTexture(Raster *raster)
 		raster->originalPixels = nil;
 	}
 	return &ext->obj;
+}
+
+// TRUE while this texture's tiled copy failed to allocate but a retry can
+// still succeed (staging pixels alive): the caller skips the mesh for those
+// frames instead of drawing it untextured — prelight-dark, the "textures
+// flashing dark" while the streamer makes room. Bounded: a texture stuck
+// failing must eventually draw SOMETHING; the dark silhouette is then the
+// diagnostic, never permanently missing geometry.
+// ponytail: 60 failed draw-attempts ~ a second; a real eviction ladder in
+// the allocator is the upgrade path if sustained failures ever show up.
+bool32
+gxTexturePending(Raster *raster)
+{
+	if(raster == nil || raster->pixels == nil)
+		return 0;
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	return !ext->hasTex && ext->tiled == nil &&
+	    ext->texFails > 0 && ext->texFails < 60;
 }
 
 // ponytail: textures are kept as linear RGBA8 staging here. GX wants 4x4

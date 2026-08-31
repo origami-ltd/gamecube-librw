@@ -873,6 +873,7 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 // im2D texture, set by the game through rwRENDERSTATETEXTURERASTER.
 static Raster *currentTexRaster;
 GXTexObj *gxGetTexture(Raster *raster);
+bool32 gxTexturePending(Raster *raster);
 
 
 static u8
@@ -2033,6 +2034,14 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// geometry untextured — a white city with correct silhouettes.
 		GXTexObj *tex = (texture && (uv || packUV)) ?
 		    gxGetTexture(texture->raster) : nil;
+		// Tiling-alloc failed under memory pressure: untextured here means
+		// vertex colours only — prelight-dark, the "textures flashing dark"
+		// on stream-in while the streamer makes room. Skip the mesh for the
+		// few frames the retry needs; gxTexturePending bounds the hide so a
+		// texture stuck failing still draws its dark silhouette eventually.
+		if(tex == nil && texture && (uv || packUV) &&
+		   gxTexturePending(texture->raster))
+			continue;
 #if GX_UV_DEBUG
 		tex = nil;  // show the raw UV colour, unmodulated by any texel
 #endif
