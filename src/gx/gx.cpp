@@ -897,6 +897,9 @@ struct GxOscEnt {
 	char   tex[16];
 };
 static GxOscEnt gxOscTab[256];
+bool32 gxOscLogEnable;   // card writes hold DVD_FS_GUARD and starve the
+                         // vorbis decode thread: dump ONLY in measurement
+                         // sessions (the game bridges its autolog gate here)
 static uint32 gxOscFrame;
 static uint32 gxOscSkipPending;  // meshes hidden by the tiling-pending skip
 static uint32 gxOscDlRecords;
@@ -935,7 +938,7 @@ static void
 gxOscFrameTick(void)
 {
 	gxOscFrame++;
-	if(gxOscFrame % 300 == 0)
+	if(gxOscFrame % 300 == 0 && gxOscLogEnable)
 		gxOscDump();
 }
 
