@@ -66,6 +66,8 @@ unsigned gxMeshCount, gxVertCount, gxDlMeshCount;
 unsigned gxSimUs, gxRenderUs, gxStreamUs;
 unsigned gxGpUs, gxVsyncUs, gxHudUs, gxTexBuilds, gxIdleUs, gxAudioUs, gxFxUs, gxListUs, gxPreUs, gxTileUs, gxPostUs, gxSkyUs, gxTailUs, gxLightsUs, gxFrameUs, gxFadeUs, gxAfterUs, gxEndUs, gxCopyUs, gxShowUs; // GP drain vs retrace wait, split // frame split, filled by the game loop
 
+extern unsigned rwTexAllocFails;   // gxraster.cpp, global scope
+
 namespace rw {
 namespace gx {
 
@@ -592,6 +594,8 @@ targetsTexture(Camera *cam)
 	return fb && (fb->type & 0xF) == Raster::CAMERATEXTURE;
 }
 
+static void gxOscFrameTick(void);   // osc probe, defined further down
+
 static void
 beginUpdate(Camera *cam)
 {
@@ -606,6 +610,7 @@ beginUpdate(Camera *cam)
 		gxHaveCamera = FALSE;
 		return;
 	}
+	gxOscFrameTick();
 	// Texture-cache invalidation happens HERE, at frame start, and nowhere
 	// else. The draw-site version ("invalidate exactly when a texture was
 	// rebuilt") ran in the MIDDLE of the frame — and on Dolphin an
@@ -874,6 +879,87 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 static Raster *currentTexRaster;
 GXTexObj *gxGetTexture(Raster *raster);
 bool32 gxTexturePending(Raster *raster);
+
+// ---------------------------------------------------------------- osc probe
+// Measure the dark-flash oscillations instead of theorising about them: a
+// per-mesh render-state signature, tracked across frames. When the same
+// mesh draws with a different signature within a second, that is one
+// oscillation; the dump names the texture and the exact bits that flipped.
+// sig bits: 1=tex 2=idx 4=cache 8=fade 16=pack 32=env 64=dl-replay,
+// bits 8..11 = ambient luminance step. dvd:/osc.log, one block every ~5s.
+struct GxOscEnt {
+	void  *geo;
+	uint16 mesh;
+	uint16 lastSig;
+	uint32 lastFrame;
+	uint16 flips;
+	uint16 from, to;
+	char   tex[16];
+};
+static GxOscEnt gxOscTab[256];
+static uint32 gxOscFrame;
+static uint32 gxOscSkipPending;  // meshes hidden by the tiling-pending skip
+static uint32 gxOscDlRecords;
+
+static void
+gxOscNote(void *geo, uint16 m, uint16 sig, const char *texname)
+{
+	uint32 h = (((uintptr)geo) >> 5) ^ m;
+	GxOscEnt *e = &gxOscTab[h & 255];
+	if(e->geo != geo || e->mesh != m){
+		e->geo = geo;
+		e->mesh = m;
+		e->lastSig = sig;
+		e->lastFrame = gxOscFrame;
+		e->flips = 0;
+		e->tex[0] = 0;
+		if(texname){
+			strncpy(e->tex, texname, sizeof(e->tex)-1);
+			e->tex[sizeof(e->tex)-1] = 0;
+		}
+		return;
+	}
+	if(sig != e->lastSig && gxOscFrame - e->lastFrame <= 60){
+		e->from = e->lastSig;
+		e->to = sig;
+		if(e->flips < 0xFFFF)
+			e->flips++;
+	}
+	e->lastSig = sig;
+	e->lastFrame = gxOscFrame;
+}
+
+static void gxOscDump(void);
+
+static void
+gxOscFrameTick(void)
+{
+	gxOscFrame++;
+	if(gxOscFrame % 300 == 0)
+		gxOscDump();
+}
+
+static void
+gxOscDump(void)
+{
+	DVD_FS_GUARD;
+	FILE *f = fopen("dvd:/osc.log", "a");
+	if(f == nil)
+		return;
+	fprintf(f, "OSCHB f=%u skiptex=%u dlrec=%u dlplay=%u texfail=%u\n",
+	    (unsigned)gxOscFrame, (unsigned)gxOscSkipPending,
+	    (unsigned)gxOscDlRecords, (unsigned)gxDlMeshCount,
+	    ::rwTexAllocFails);
+	for(int32 i = 0; i < 256; i++){
+		GxOscEnt *e = &gxOscTab[i];
+		if(e->flips >= 2)
+			fprintf(f, "OSC tex=%-15s flips=%u sig %03x->%03x\n",
+			    e->tex, (unsigned)e->flips, (unsigned)e->from,
+			    (unsigned)e->to);
+		e->flips = 0;
+	}
+	fclose(f);
+}
 
 
 static u8
@@ -2050,8 +2136,10 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// few frames the retry needs; gxTexturePending bounds the hide so a
 		// texture stuck failing still draws its dark silhouette eventually.
 		if(tex == nil && texture && (uv || packUV) &&
-		   gxTexturePending(texture->raster))
+		   gxTexturePending(texture->raster)){
+			gxOscSkipPending++;
 			continue;
+		}
 #if GX_UV_DEBUG
 		tex = nil;  // show the raw UV colour, unmodulated by any texel
 #endif
@@ -2338,13 +2426,27 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// time-of-day ambient rides the TEV konst instead) and unskinned
 		// (skinned vertices are rebuilt every frame by definition).
 		GxGeoExt *gext = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
+		// osc probe: one signature per mesh per frame, replay path included.
+		{
+			uint16 oscSig = (tex ? 1 : 0) | (useIdx ? 2 : 0) |
+			    (cachedCol ? 4 : 0) | (stMaterialAlpha ? 8 : 0) |
+			    (packPos ? 16 : 0) | (gxEnvTex ? 32 : 0) |
+			    ((gext->lists && gext->numLists > (int32)m &&
+			      gext->lists[m]) ? 64 : 0) |
+			    (uint16)(((ambR8 + ambG8 + ambB8) / 48) << 8);
+			gxOscNote(geo, m, oscSig, texture ? texture->name : nil);
+		}
 		// GX_DL_BUDGET 0 disables caching entirely — and it must also skip
 		// the per-geometry bookkeeping arrays, or every geometry still
 		// callocs one it will never use. That silent drain starved the
 		// texture allocator until gxGetTexture returned nil and the whole
 		// world drew untextured white.
+		// !stMaterialAlpha: a list recorded mid-FADE bakes that frame's
+		// half-alpha vertex colours permanently — with streaming churn each
+		// reload re-recorded at a random fade phase, so the same mesh came
+		// back sometimes dark, sometimes bright. Never record a fade.
 		bool32 canCache = GX_DL_BUDGET > 0 && prelitMesh &&
-		    !skinnedAtomic && !useIdx;
+		    !skinnedAtomic && !useIdx && !stMaterialAlpha;
 		if(canCache && gext->lists == nil){
 			int32 n = geo->meshHeader->numMeshes;
 			gext->lists = (void**)calloc(n, sizeof(void*));
@@ -2374,6 +2476,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 					DCInvalidateRange(buf, cap); // WGP bypasses the cache
 					GX_BeginDispList(buf, cap);
 					recording = 1;
+					gxOscDlRecords++;
 					gext->lists[m] = buf;
 				}
 			}
