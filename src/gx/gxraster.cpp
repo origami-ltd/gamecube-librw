@@ -205,6 +205,17 @@ gxPackGeometry(Geometry *geo)
 		return;
 	if(Skin::get(geo))
 		return;
+	// Packing frees the float arrays including the normals, and the env
+	// stage in atomicRenderCB is gated on `normals && !packPos` — so a
+	// reflective floor kept its shine only until the pack ran, then went
+	// matte. With the streamer churning interiors in and out of the 24MB
+	// budget, those floors BLINKED between shiny and dark. Env-mapped world
+	// meshes are few and small: keep their floats, keep the shine stable.
+	for(int32 i = 0; i < geo->matList.numMaterials; i++){
+		MatFX *mfx = MatFX::get(geo->matList.materials[i]);
+		if(mfx && (mfx->type == MatFX::ENVMAP || mfx->type == MatFX::BUMPENVMAP))
+			return;
+	}
 
 	MorphTarget *mt = &geo->morphTargets[0];
 	V3d *verts = mt->vertices;
