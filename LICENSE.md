@@ -1,6 +1,7 @@
 # MIT License with Proof-of-Usage Condition (MIT-PoU)
 
-Copyright (c) 2026 mrxenginner (GameCube GX backend and port changes)
+Copyright (c) 2026 Origami Ltd and the reVC-GameCube contributors
+(GameCube GX backend and related fork changes)
 
 Original librw: Copyright (c) 2014 aap, MIT License — see LICENSE.
 
