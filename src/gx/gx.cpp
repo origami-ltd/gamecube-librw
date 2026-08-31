@@ -1739,6 +1739,16 @@ gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
 {
 	if(prelit == nil || numDir != 0)
 		return 0;
+	// A fading mesh changes matcol.alpha every frame, which is a key miss
+	// and an IN-PLACE rebuild of an array the GP may still be DMA-reading
+	// from the previous frame — the flush orders memory, it does not wait
+	// for the GP. Big per-frame deltas made the tear visible: freshly
+	// streamed models (exactly the distant ones, and interior floors)
+	// flashed dark patches through their whole fade. Fades take the
+	// immediate path instead; the cache serves the steady state, where a
+	// rebuild only ever moves one timecycle step and a tear is invisible.
+	if(matcol.alpha != 255)
+		return 0;
 	int32 n = geo->numVertices;
 	if(n <= 0)
 		return 0;
