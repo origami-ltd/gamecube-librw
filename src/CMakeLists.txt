@@ -100,6 +100,14 @@ add_library(librw
     ps2/rwps2plg.h
 )
 add_library(librw::librw ALIAS librw)
+if(NINTENDO_OGC)
+    # dca3 compiles its render backend and base at -O3 above an -Os build;
+    # same split here (gx = the GameCube backend, base = the maths).
+    foreach(hot base.cpp gx/gx.cpp gx/gxraster.cpp)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/${hot}
+            PROPERTIES COMPILE_OPTIONS "-O3")
+    endforeach()
+endif()
 
 target_include_directories(librw
     INTERFACE

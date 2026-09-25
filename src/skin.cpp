@@ -147,6 +147,11 @@ readSkin(Stream *stream, int32 len, void *object, int32 offset, int32)
 		skin->init(header[0], header[0], geometry->numVertices);
 	else
 		skin->init(header[0], header[1], geometry->numVertices);
+	if(skin->data == nil){   // B126: out of memory — fail this read, the streamer retries
+		rwFree(skin);
+		*PLUGINOFFSET(Skin*, geometry, offset) = nil;
+		return nil;
+	}
 	skin->numWeights = header[2];
 
 	if(!oldFormat)
@@ -265,6 +270,7 @@ readSkinLegacy(Stream *stream, int32 len, void *object, int32, int32)
 	Skin *skin = rwNewT(Skin, 1, MEMDUR_EVENT | ID_SKIN);
 	*PLUGINOFFSET(Skin*, geometry, skinGlobals.geoOffset) = skin;
 	skin->init(numBones, numBones, numVertices);
+	if(skin->data == nil){ rwFree(skin); *PLUGINOFFSET(Skin*, geometry, skinGlobals.geoOffset) = nil; return nil; }   // B126
 	skin->legacyType = 1;
 	skin->numWeights = 4;
 
@@ -396,7 +402,11 @@ Skin::init(int32 numBones, int32 numUsedBones, int32 numVertices)
 	uint32 size = this->numUsedBones +
 	              this->numBones*64 +
 	              numVertices*(16+4) + 0xF;
-	this->data = rwNewT(uint8, size, MEMDUR_EVENT | ID_SKIN);
+	// B126 (GameCube): a skin that cannot get its block must fail the LOAD,
+	// not the game — mustmalloc here was "Error: out of memory" + exit at the
+	// docks scene with 1.5MB free in crumbs. Callers check data == nil.
+	this->data = (uint8*)rwMalloc(size, MEMDUR_EVENT | ID_SKIN);
+	if(this->data == nil){ this->usedBones = nil; this->inverseMatrices = nil; this->indices = nil; this->weights = nil; return; }
 	uint8 *p = this->data;
 
 	this->usedBones = nil;

@@ -21,7 +21,12 @@
 
 #define PLUGIN_ID 2
 
+extern unsigned rwGeoAllocFails;
+
 namespace rw {
+#ifdef RW_GAMECUBE
+namespace gx { Stream *gxReadNativeGeometry(Stream *stream, int32 len, void *object, int32 o, int32 s); }
+#endif
 
 static uint16 nextSerialNum = 1;
 
@@ -30,7 +35,7 @@ static uint16 nextSerialNum = 1;
 // Allocate a mesh header, meshes and optionally indices.
 // If existing meshes already exist, retain their information.
 MeshHeader*
-Geometry::allocateMeshes(int32 numMeshes, uint32 numIndices, bool32 noIndices)
+Geometry::allocateMeshes(int32 numMeshes, uint32 numIndices, bool32 noIndices, bool32 canFail)
 {
 	uint32 sz;
 	MeshHeader *mh;
@@ -43,11 +48,15 @@ Geometry::allocateMeshes(int32 numMeshes, uint32 numIndices, bool32 noIndices)
 		sz += numIndices*sizeof(uint16);
 	if(this->meshHeader){
 		oldNumMeshes = this->meshHeader->numMeshes;
-		mh = (MeshHeader*)rwResize(this->meshHeader, sz, MEMDUR_EVENT | ID_GEOMETRY);
+		mh = (MeshHeader*)(canFail ? rwRealloc(this->meshHeader, sz, MEMDUR_EVENT | ID_GEOMETRY) :
+		    rwResize(this->meshHeader, sz, MEMDUR_EVENT | ID_GEOMETRY));
+		if(mh == nil){ rwGeoAllocFails++; return nil; }
 		this->meshHeader = mh;
 	}else{
 		oldNumMeshes = 0;
-		mh = (MeshHeader*)rwNew(sz, MEMDUR_EVENT | ID_GEOMETRY);
+		mh = (MeshHeader*)(canFail ? rwMalloc(sz, MEMDUR_EVENT | ID_GEOMETRY) :
+		    rwNew(sz, MEMDUR_EVENT | ID_GEOMETRY));
+		if(mh == nil){ rwGeoAllocFails++; return nil; }
 		mh->flags = 0;
 		this->meshHeader = mh;
 	}
@@ -122,7 +131,9 @@ readMesh(Stream *stream, int32 len, void *object, int32, int32)
 	assert(geo->meshHeader == nil);
 	geo->meshHeader = nil;
 	mh = geo->allocateMeshes(mhs.numMeshes, mhs.totalIndices, 
-		geo->flags & Geometry::NATIVE && !hasData);
+		geo->flags & Geometry::NATIVE && !hasData, 1);
+	if(mh == nil)
+		return nil;
 	mh->flags = mhs.flags;
 
 	mesh = mh->getMeshes();
@@ -276,6 +287,10 @@ readNativeData(Stream *stream, int32 len, void *object, int32 o, int32 s)
 			return d3d8::readNativeData(stream, len, object, o, s);
 		else if(platform == PLATFORM_D3D9)
 			return d3d9::readNativeData(stream, len, object, o, s);
+#ifdef RW_GAMECUBE
+		else if(platform == PLATFORM_GAMECUBE)   // B178: dffnative.py
+			return gx::gxReadNativeGeometry(stream, len, object, o, s);
+#endif
 		else{
 			fprintf(stderr, "unknown platform %d\n", platform);
 			stream->seek(len);

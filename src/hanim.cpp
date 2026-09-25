@@ -159,6 +159,13 @@ HAnimHierarchy::updateMatrices(void)
 	Frame *frm, *parfrm;
 	int32 i;
 	AnimInterpolator *anim = this->interpolator;
+	// A hierarchy that never received an animation has no applyCB: the
+	// streamer dropped its anim block after three failed loads (memory), the
+	// ped was spawned anyway, and the first update here jumped through nil
+	// (B12: CCopPed ctor → ISI at PC 0). Leave the matrices as they are —
+	// bind pose — rather than crash.
+	if(anim == nil || anim->applyCB == nil)
+		return;
 
 	sp = stack;
 	curMat = this->matrices;

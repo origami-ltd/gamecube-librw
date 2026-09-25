@@ -41,9 +41,6 @@ namespace { struct DvdFsGuard {
 extern "C" void __console_init(void *fb, int xstart, int ystart, int xres,
     int yres, int stride);
 
-void GeckoLog(const char*); // game-side USB Gecko logger (gamecube.cpp)
-extern unsigned gxCopyUs;   // defined below at global scope
-extern unsigned gxShowUs;   // whole showRaster duration
 // What the VI actually came up in, latched at startGX and reported by the
 // heartbeat — see startGX for why it cannot just be printed there.
 unsigned gxViTVMode, gxHaveComponent, gxXfbHeight, gxEfbHeight;
@@ -60,11 +57,14 @@ unsigned gxWaitRetrace = 1;
 unsigned gxCamW, gxCamH;
 // Which submitter last handed work to the GP. Read by the freeze watchdog in
 // the game skel, which cannot see librw's statics.
-const char *gxLastPath = "-";
 // per-frame draw counters, read by the HUD overlay
 unsigned gxMeshCount, gxVertCount, gxDlMeshCount;
-unsigned gxSimUs, gxRenderUs, gxStreamUs;
-unsigned gxGpUs, gxVsyncUs, gxHudUs, gxTexBuilds, gxIdleUs, gxAudioUs, gxFxUs, gxListUs, gxPreUs, gxTileUs, gxPostUs, gxSkyUs, gxTailUs, gxLightsUs, gxFrameUs, gxFadeUs, gxAfterUs, gxEndUs, gxCopyUs, gxShowUs; // GP drain vs retrace wait, split // frame split, filled by the game loop
+extern unsigned gxFrameNo;   // defined in gxraster.cpp, one per presented frame
+extern unsigned gxColorBytes; // colour-cache arrays resident (gxraster.cpp), census 'col'
+extern "C" { extern volatile unsigned gVblTick; }
+extern "C" void *gcBigAlloc(size_t); extern "C" void *__real_malloc(size_t);   // B121: colour-cache arrays bypass the shedding wrapper
+static void gxVblTick(u32){ gVblTick++; }
+extern "C" { volatile unsigned gxLastDraw, gxLastGeoFlags, gxLastGeoVerts; }   // MemoryWatcher: the draw being set up when a GP stall parks the thread
 
 extern unsigned rwTexAllocFails;   // gxraster.cpp, global scope
 
@@ -100,7 +100,6 @@ namespace gx {
 #define GX_UV_DEBUG 0
 #define GX_PROBE_SKIN 0
 #if GX_PROBE_SKIN
-static int32 gxProbeLeft = 300; // every mesh of one atomic, ~1 atomic/second
 #endif
 
 extern bool32 gxTexCacheDirty; // set by gxraster when a texture is (re)built
@@ -242,6 +241,9 @@ startGX(void)
 		return;
 
 	VIDEO_Init();
+	// VIDEO_Init clears the retrace callbacks the skeleton registered: re-arm
+	// the liveness tick Dolphin's MemoryWatcher reads.
+	VIDEO_SetPostRetraceCallback(gxVblTick);
 	rmode = VIDEO_GetPreferredMode(nil);
 
 	// 480p. VIDEO_GetPreferredMode hands back a progressive mode only when the
@@ -595,11 +597,13 @@ targetsTexture(Camera *cam)
 }
 
 static void gxOscFrameTick(void);   // osc probe, defined further down
+static void gxColorRetireSweep(void);   // colour-cache retire ring, defined further down
 
 static void
 beginUpdate(Camera *cam)
 {
 	startGX();
+	gx3DMemoInvalidate();   // TEXMAP1 may hold a window block the LRU refilled since last frame
 	gxOffscreenPass = targetsTexture(cam);
 	if(gxOffscreenPass){
 		// nothing may draw: the 3D paths all gate on gxHaveCamera. Saved and
@@ -688,62 +692,19 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 // Last state handed to the GP, so a stall can name what it choked on rather
 // than leaving a frozen screen and nothing else. Updated once per draw call,
 // which is a handful of stores — not per vertex.
-struct GxLastDraw {
-	const char *path;
-	const char *texName;
-	Raster *texRaster;
-	uint32 count;
-	uint16 texW, texH;
-	uint8 hasTex, prim, vtxfmt, posFrac, uvFrac;
-};
-static GxLastDraw gxLast;
 
-static void
-gxReportGpStall(void)
-{
-	// Bounded: a stall normally repeats on every frame after the first, and a
-	// log that fills the SD helps nobody.
-	static int left = 8;
-	if(left-- <= 0)
-		return;
-	char line[256];
-	snprintf(line, sizeof(line),
-	    "GPSTALL path=%s tex=%s raster=%p %ux%u has=%d prim=%d fmt=%d "
-	    "count=%u posFrac=%d uvFrac=%d",
-	    gxLast.path ? gxLast.path : "-",
-	    gxLast.texName ? gxLast.texName : "-",
-	    (void*)gxLast.texRaster, (unsigned)gxLast.texW, (unsigned)gxLast.texH,
-	    (int)gxLast.hasTex, (int)gxLast.prim, (int)gxLast.vtxfmt,
-	    (unsigned)gxLast.count, (int)gxLast.posFrac, (int)gxLast.uvFrac);
-	// Gecko truncates past a couple of dozen characters, so the transport
-	// that carries the detail is the SD; the Gecko line is only the flag that
-	// tells you to go read it.
-	GeckoLog("GPSTALL");
-	DVD_FS_GUARD;
-	FILE *f = fopen("dvd:/gpstall.log", "a");
-	if(f){
-		fprintf(f, "%s\n", line);
-		fclose(f);
-	}
-	// Best effort: drop whatever the GP is chewing on so the next frame has a
-	// chance. If it stalls again the log says so, which is still progress on a
-	// freeze that previously produced no evidence at all.
-	GX_AbortFrame();
-}
+
+void gxTierFrameEnd(void);   // gxraster.cpp
+
+extern "C" { extern volatile const char *gMainWhere; }
 
 static void
 showRaster(Raster *raster, uint32 flags)
 {
-	// Whole-call timer. Its internals (copy, DrawDone, retrace) already
-	// measure ~6ms while DoRWStuffEndOfFrame measures ~23ms; this says
-	// whether the missing 16ms is inside showRaster (in the untimed
-	// GX_Flush / VIDEO_Flush statements) or before it.
-	extern unsigned gxShowUs;
-	unsigned long long tShow = gettime();
-	struct ShowTimer {
-		unsigned long long t;
-		~ShowTimer(){ ::gxShowUs = (unsigned)ticks_to_microsecs(gettime() - t); }
-	} showTimer = { tShow };
+	gMainWhere = "present";
+	::gxFrameNo++;   // the ARAM tier's LRU clock (gxraster.cpp)
+	gxColorRetireSweep();
+	gxTierFrameEnd();
 	// The camera raster IS the render target, so its size is the answer to
 	// "what resolution is the game actually drawing" — measured, rather than
 	// inferred from the video mode, which is 640x480 and says nothing about
@@ -779,14 +740,7 @@ showRaster(Raster *raster, uint32 flags)
 		currentXfb = (xfb[next] == shown) ? currentXfb : next;
 	}
 	{
-		// GX_CopyDisp only queues commands, so it should be ~free. If it
-		// is not, the CPU is blocking on FIFO space — i.e. waiting for the
-		// GP to drain, which would mean the GP is the real bottleneck and
-		// the earlier GX_DrawDone reading of 0ms was just measuring an
-		// already-empty queue.
-		unsigned long long t0 = gettime();
 		GX_CopyDisp(xfb[currentXfb], GX_TRUE);
-		::gxCopyUs = (unsigned)ticks_to_microsecs(gettime() - t0);
 	}
 	// DrawDone AFTER queuing the copy (the libogc order). Calling it
 	// first made the CPU wait for the GP to drain, then queue the copy,
@@ -814,16 +768,13 @@ showRaster(Raster *raster, uint32 flags)
 		unsigned long long deadline = t0 + millisecs_to_ticks(500);
 		while(GX_GetDrawSync() != syncToken)
 			if(gettime() > deadline){
-				gxReportGpStall();
 				break;
 			}
-		gxGpUs = (unsigned)ticks_to_microsecs(gettime() - t0);
 	}
 	GX_Flush();
 
 	VIDEO_SetNextFramebuffer(xfb[currentXfb]);
 	VIDEO_Flush();
-	unsigned long long tv = gettime();
 	// Single retrace. The two-retrace lock was written on the assumption
 	// that a frame costs more than 33ms; instrumenting the loop showed
 	// simulation at ~10ms and scene submission at ~1ms, so the lock was
@@ -839,7 +790,6 @@ showRaster(Raster *raster, uint32 flags)
 	// which is the number you want when deciding what to optimise.
 	if(::gxWaitRetrace)
 		VIDEO_WaitVSync();
-	gxVsyncUs = (unsigned)ticks_to_microsecs(gettime() - tv);
 }
 
 static bool32
@@ -896,8 +846,7 @@ struct GxOscEnt {
 	uint16 from, to;
 	char   tex[16];
 };
-static GxOscEnt gxOscTab[256];
-bool32 gxOscLogEnable;   // card writes hold DVD_FS_GUARD and starve the
+static GxOscEnt gxOscTab[1];   // probe retired (B48)
                          // vorbis decode thread: dump ONLY in measurement
                          // sessions (the game bridges its autolog gate here)
 static uint32 gxOscFrame;
@@ -907,6 +856,7 @@ static uint32 gxOscDlRecords;
 static void
 gxOscNote(void *geo, uint16 m, uint16 sig, const char *texname)
 {
+	return;   // probe retired (B48)
 	uint32 h = (((uintptr)geo) >> 5) ^ m;
 	GxOscEnt *e = &gxOscTab[h & 255];
 	if(e->geo != geo || e->mesh != m){
@@ -932,39 +882,16 @@ gxOscNote(void *geo, uint16 m, uint16 sig, const char *texname)
 	e->lastFrame = gxOscFrame;
 }
 
-static void gxOscDump(void);
 static void gxColorRetireSweep(void);
 
 static void
 gxOscFrameTick(void)
 {
+	return;   // probe retired (B48)
 	gxOscFrame++;
 	gxColorRetireSweep();
-	if(gxOscFrame % 300 == 0 && gxOscLogEnable)
-		gxOscDump();
 }
 
-static void
-gxOscDump(void)
-{
-	DVD_FS_GUARD;
-	FILE *f = fopen("dvd:/osc.log", "a");
-	if(f == nil)
-		return;
-	fprintf(f, "OSCHB f=%u skiptex=%u dlrec=%u dlplay=%u texfail=%u\n",
-	    (unsigned)gxOscFrame, (unsigned)gxOscSkipPending,
-	    (unsigned)gxOscDlRecords, (unsigned)gxDlMeshCount,
-	    ::rwTexAllocFails);
-	for(int32 i = 0; i < 256; i++){
-		GxOscEnt *e = &gxOscTab[i];
-		if(e->flips >= 2)
-			fprintf(f, "OSC tex=%-15s flips=%u sig %03x->%03x\n",
-			    e->tex, (unsigned)e->flips, (unsigned)e->from,
-			    (unsigned)e->to);
-		e->flips = 0;
-	}
-	fclose(f);
-}
 
 
 static u8
@@ -1203,25 +1130,6 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 	setupIm2DVtxDesc(tex != nil);
 	setIm2DMatrices();
 
-	// Blend truth at draw time, additive draws only (rain family). One line
-	// per state change, bounded — gecko drops floods.
-	{
-		extern bool32 gxForceAddBlend;
-		static uint32 lastKey = ~0u;
-		static int32 left = 40;
-		uint32 key = (stVertexAlpha<<16) | (stSrcBlend<<8) | stDstBlend;
-		if(stSrcBlend == BLENDONE && stDstBlend == BLENDONE &&
-		   key != lastKey && left-- > 0){
-			lastKey = key;
-			char bl[64];
-			snprintf(bl, sizeof(bl), "IM2D va=%u src=%u dst=%u ta=%u",
-			    (unsigned)stVertexAlpha, (unsigned)stSrcBlend,
-			    (unsigned)stDstBlend, (unsigned)stTextureAlpha);
-			GeckoLog(bl);
-		}
-		if(gxForceAddBlend && stSrcBlend == BLENDONE && stDstBlend == BLENDONE)
-			GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
-	}
 
 	// Corner-artifact hunter: any small quad landing in the top-left region
 	// names itself — texture, size, blend, alpha. Bounded; card-logged so
@@ -1250,23 +1158,10 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 				    (unsigned)stDstBlend,
 				    (unsigned)verts[indices ? idx[0] : 0].a);
 				DVD_FS_GUARD;
-				FILE *cf = fopen("dvd:/automenu.log", "a");
-				if(cf){ fputs(cl, cf); fclose(cf); }
 			}
 		}
 	}
 
-	gxLastPath = "2d";
-	gxLast.path = "2d";
-	gxLast.texName = nil;
-	gxLast.texRaster = currentTexRaster;
-	gxLast.texW = currentTexRaster ? currentTexRaster->width : 0;
-	gxLast.texH = currentTexRaster ? currentTexRaster->height : 0;
-	gxLast.hasTex = tex != nil;
-	gxLast.prim = prim;
-	gxLast.vtxfmt = 0;
-	gxLast.count = count;
-	gxLast.posFrac = gxLast.uvFrac = 0xFF;
 
 	GX_Begin(prim, GX_VTXFMT0, count);
 	for(int32 i = 0; i < count; i++){
@@ -1342,8 +1237,9 @@ static void
 setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	RGBA matcol, float surfAmb, const RGBAf *ambLight, u8 lightMask,
 	bool32 sendColor, bool32 indexed = 0, RGBA ambAdd = {0,0,0,0},
-	u8 posFrac = 0xFF, u8 uvFrac = 0xFF)
+	u8 posFrac = 0xFF, u8 uvFrac = 0xFF, bool32 nrmS8 = 0)
 {
+	gxLastDraw = (textured?1:0) | (lit?2:0) | (prelit?4:0) | (haveNormals?8:0) | (sendColor?16:0) | (indexed?32:0) | (nrmS8?64:0) | (gxEnvTex?128:0) | (gxEnvUV2?256:0) | ((unsigned)lightMask << 16);
 	// stMaterialAlpha is set by the CALLER from the real material — the
 	// atomic path bakes the material colour into the vertex stream and hands
 	// this function white, which is how the first version of this flag
@@ -1367,19 +1263,21 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	static bool32 mTexOpaque;
 	static bool32 mSend;
 	static u8 mPosFrac = 0xFF, mUvFrac = 0xFF;
+	static bool32 mNrmS8;
 	static void *mEnvTex;
 	static u32 mEnvK32;
+	static bool32 mEnvUV2;
 	u32 envK32 = ((u32)gxEnvK.r<<24)|((u32)gxEnvK.g<<16)|((u32)gxEnvK.b<<8)|gxEnvK.a;
 	RGBAf ambl = ambLight ? *ambLight : (RGBAf){0,0,0,0};
 	if(!gx3DMemoDirty && mT == textured && mL == lit && mP == prelit &&
 	   mN == haveNormals && mMask == lightMask && mAmb == surfAmb &&
 	   mIdx == indexed && mTexOpaque == stTexOpaque && mSend == sendColor &&
-	   mPosFrac == posFrac && mUvFrac == uvFrac &&
+	   mPosFrac == posFrac && mUvFrac == uvFrac && mNrmS8 == nrmS8 &&
 	   *(uint32*)&mAmbAdd == *(uint32*)&ambAdd &&
 	   *(uint32*)&mMat == *(uint32*)&matcol &&
 	   mAmbL.red == ambl.red && mAmbL.green == ambl.green &&
 	   mAmbL.blue == ambl.blue &&
-	   mEnvTex == (void*)gxEnvTex && mEnvK32 == envK32){
+	   mEnvTex == (void*)gxEnvTex && mEnvK32 == envK32 && mEnvUV2 == gxEnvUV2){
 		applyBlend();
 		applyZMode();
 		applyAlphaTest();
@@ -1390,10 +1288,10 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	gx2DMemoInvalidate();
 	mT = textured; mL = lit; mP = prelit; mN = haveNormals;
 	mMask = lightMask; mAmb = surfAmb; mMat = matcol; mAmbL = ambl;
-	mEnvTex = (void*)gxEnvTex; mEnvK32 = envK32;
+	mEnvTex = (void*)gxEnvTex; mEnvK32 = envK32; mEnvUV2 = gxEnvUV2;
 	mIdx = indexed; mAmbAdd = ambAdd; mTexOpaque = stTexOpaque;
 	mSend = sendColor;
-	mPosFrac = posFrac; mUvFrac = uvFrac;
+	mPosFrac = posFrac; mUvFrac = uvFrac; mNrmS8 = nrmS8;
 
 	u8 attrMode = indexed ? GX_INDEX16 : GX_DIRECT;
 	GX_ClearVtxDesc();
@@ -1411,7 +1309,7 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	// instead; the two are never armed together.
 	if(hwLights || envOn){
 		GX_SetVtxDesc(GX_VA_NRM, attrMode);
-		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+		GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_NRM, GX_NRM_XYZ, nrmS8 ? GX_S8 : GX_F32, 0);
 	}
 	if(dualOn){
 		GX_SetVtxDesc(GX_VA_TEX1, attrMode);
@@ -1592,17 +1490,10 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 // vertex alpha, standard alpha blend. Called by screendroplets.cpp, which
 // owns the drop simulation; this owns only the draw.
 static GXTexObj *gxDropMask, *gxDropScreen;
-// Global namespace on purpose: set from game code (screendroplets.cpp) via a
-// plain extern, no rw::gx include dance. Red = mask shape/alpha isolated.
-bool32 gxScreenDropDebugRed;
-bool32 gxScreenDropDebugMask;
 static uint32 gxDropSaved[6];
 // Additive glint for the MBlur water/blood drops (0 = plain modulate, the
 // rain lens-drops). Set before gxDropletBegin, cleared by gxDropletEnd.
 uint8 gxDropletBrighten;
-bool32 gxForceAddBlend;   // dvd:/autoblend.txt: force ONE/ONE on additive im2D
-uint32 gxDropQuads;      // quads actually drawn this frame
-int32 gxDropBeginState;  // 1 ok, -1 mask nil, -2 screen nil, 0 never ran
 
 GXTexObj *gxGetTexture(Raster*);
 
@@ -1615,7 +1506,6 @@ gxDropletBegin(Raster *mask, Raster *screen)
 	// is understood. Soft translucent drops, correct shape, no refraction.
 	gxDropMask = mask ? gxGetTexture(mask) : nil;
 	gxDropScreen = screen ? gxGetTexture(screen) : nil;
-	gxDropBeginState = gxDropMask == nil ? -1 : gxDropScreen == nil ? -2 : 1;
 	if(gxDropMask == nil)
 		return;
 	// The droplet pass owns its blend/Z; save the tracked state and restore
@@ -1687,7 +1577,6 @@ gxDropletQuad(const float *px, const float *py, float u2l, float v2t,
 		return;
 	static const float mu[4]  = { 0.0f, 0.0f, 1.0f, 1.0f };
 	static const float mv2[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
-	gxDropQuads++;
 	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 	for(int i = 0; i < 4; i++){
 		GX_Position3f32(px[i], py[i], 0.0f);
@@ -1835,16 +1724,17 @@ gxColorRetire(void *p)
 	for(int32 i = 0; i < 64; i++)
 		if(gxColorRetired[i].p == nil){
 			gxColorRetired[i].p = p;
-			gxColorRetired[i].frame = gxOscFrame;
+			gxColorRetired[i].frame = ::gxFrameNo;
 			return;
 		}
-	rwFree(p);   // ring full; with ~a handful of rebuilds per frame, unreachable
+	GX_DrawDone();
+	rwFree(p);
 }
 static void
 gxColorRetireSweep(void)
 {
 	for(int32 i = 0; i < 64; i++)
-		if(gxColorRetired[i].p && gxOscFrame - gxColorRetired[i].frame >= 2){
+		if(gxColorRetired[i].p && ::gxFrameNo - gxColorRetired[i].frame >= 2){
 			rwFree(gxColorRetired[i].p);
 			gxColorRetired[i].p = nil;
 		}
@@ -1858,37 +1748,33 @@ gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
 {
 	if(prelit == nil || numDir != 0)
 		return 0;
-	// A fading mesh changes matcol.alpha every frame, which is a key miss
-	// and an IN-PLACE rebuild of an array the GP may still be DMA-reading
-	// from the previous frame — the flush orders memory, it does not wait
-	// for the GP. Big per-frame deltas made the tear visible: freshly
-	// streamed models (exactly the distant ones, and interior floors)
-	// flashed dark patches through their whole fade. Fades take the
-	// immediate path instead; the cache serves the steady state, where a
-	// rebuild only ever moves one timecycle step and a tear is invisible.
 	if(matcol.alpha != 255)
 		return 0;
 	int32 n = geo->numVertices;
 	if(n <= 0)
 		return 0;
 
-	// One key covering everything that is not per-vertex. A mismatch rebuilds;
-	// a match is free.
-	uint32 key = (uint32)ambR8 | ((uint32)ambG8<<8) | ((uint32)ambB8<<16) ^
-	    (*(uint32*)&matcol * 2654435761u);
-	if(g->colors && g->colorCount == n && g->colorKey == key)
+	uint32 ambient = (uint32)ambR8 | ((uint32)ambG8<<8) | ((uint32)ambB8<<16);
+	uint32 key = (uint32)matcol.red | ((uint32)matcol.green<<8) |
+	    ((uint32)matcol.blue<<16) | ((uint32)matcol.alpha<<24);
+	if(g->colors && g->colorCount == n && g->colorKey == key && g->colorAmbient == ambient){
+		g->colorFrame = ::gxFrameNo;
 		return 1;
+	}
+	// A second material of the same geometry this frame: draw it immediate
+	// instead of rebuilding the cache once per mesh, every frame.
+	if(g->colors && g->colorFrame == ::gxFrameNo)
+		return 0;
 
-	// Publish-then-retire, never rebuild in place: the GP may still be
-	// DMA-reading the OLD array from the previous frame's FIFO (the flush
-	// orders memory, it does not wait for the GP). An in-place rewrite on
-	// an ambient step tore mid-read — intermittent wrong-colour flashes on
-	// exactly the meshes whose ambient moves (the lobby floor at dawn).
-	// The new array is filled and flushed BEFORE the pointer flips; the old
-	// one waits two frames in gxColorRetire before it is freed.
-	RGBA *fresh = (RGBA*)rwMalloc(n*sizeof(RGBA), MEMDUR_EVENT | ID_GEOMETRY);
-	if(fresh == nil)
-		return g->colors != nil && g->colorCount == n;  // stale beats torn
+	// showRaster drains the previous frame. Only buffers used in this frame
+	// still belong to the GPU; the check above leaves those untouched.
+	RGBA *fresh = g->colorCount == n ? g->colors : nil;
+	if(fresh == nil){
+		fresh = (RGBA*)gcBigAlloc(n*sizeof(RGBA));
+		if(fresh == nil) fresh = (RGBA*)__real_malloc(n*sizeof(RGBA));
+		if(fresh == nil)
+			return 0;
+	}
 	for(int32 i = 0; i < n; i++){
 		int r8 = clamp255i(ambR8 + prelit[i].red);
 		int g8 = clamp255i(ambG8 + prelit[i].green);
@@ -1899,10 +1785,16 @@ gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
 		fresh[i].alpha = (uint8)mul255(prelit[i].alpha, matcol.alpha);
 	}
 	DCFlushRange(fresh, n*sizeof(RGBA));
-	gxColorRetire(g->colors);
-	g->colors = fresh;
-	g->colorCount = n;
+	if(fresh != g->colors){
+		if(g->colors) ::gxColorBytes -= g->colorCount*sizeof(RGBA);
+		gxColorRetire(g->colors);
+		g->colors = fresh;
+		g->colorCount = n;
+		::gxColorBytes += n*sizeof(RGBA);
+	}
 	g->colorKey = key;
+	g->colorAmbient = ambient;
+	g->colorFrame = ::gxFrameNo;
 	return 1;
 }
 
@@ -1915,6 +1807,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	   geo->meshHeader == nil || geo->morphTargets == nil ||
 	   !gxStarted || !gxHaveCamera)
 		return;
+	gxLastGeoFlags = geo->flags; gxLastGeoVerts = geo->numVertices;
 
 	// gxPackGeometry replaces the float positions and texcoords of streamed
 	// world geometry with int16 arrays and frees the originals, so either side
@@ -1922,14 +1815,13 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	GxGeoExt *gpk = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
 	const int16 *packPos = (gpk->packed & GXPACK_POS) ? gpk->pos : nil;
 	const int16 *packUV = (gpk->packed & GXPACK_UV) ? gpk->uv : nil;
+	const int8 *packNrm = (gpk->packed & GXPACK_NRM) ? gpk->nrm : nil;
 	u8 posFrac = packPos ? gpk->posShift : 0xFF;
 	u8 uvFrac = packUV ? gpk->uvShift : 0xFF;
 	// Both sides nil happens when a pack ran out of memory after freeing the
 	// floats; feeding GX a null array crashed the GC build (nil+0x14 read in
 	// this function). Skip the atomic and say so once.
 	if(geo->morphTargets[0].vertices == nil && packPos == nil){
-		static bool32 said;
-		if(!said){ said = 1; GeckoLog("GXNILGEO"); }
 		return;
 	}
 
@@ -1967,8 +1859,10 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	   skin->weights && skin->indices){
 		enum { MAXBONES = 128 };
 		static Matrix boneMats[MAXBONES];
-		static V3d *skinBuf;
-		static int32 skinCap;
+		// B121: one static scratch, never malloc'd per frame (b118: a 61044-byte
+		// regrow failed every frame for 20 minutes, each failure shedding world).
+		static V3d skinBuf[8192] __attribute__((aligned(32)));
+		enum { skinCap = 8192 };
 		int32 nb = skin->numBones > MAXBONES ? MAXBONES : skin->numBones;
 		Matrix *invMats = (Matrix*)skin->inverseMatrices;
 		// Matrix::mult short-circuits when EITHER operand carries the
@@ -1999,12 +1893,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 			}
 		}
 		int32 need = geo->numVertices * (normals ? 2 : 1);
-		if(need > skinCap){
-			free(skinBuf);
-			skinBuf = (V3d*)malloc(need*sizeof(V3d));
-			skinCap = skinBuf ? need : 0;
-		}
-		if(skinBuf){
+		if(need <= skinCap){
 			skinnedAtomic = 1;
 			V3d *outP = skinBuf;
 			V3d *outN = normals ? skinBuf + geo->numVertices : nil;
@@ -2059,7 +1948,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	// Doing the reference math on the CPU and streaming the result as a plain
 	// vertex color removes the whole hardware-lighting path along with that
 	// entire class of bug, and is less code than the mapping it replaces.
-	bool lit2 = lit && normals != nil;
+	bool lit2 = lit && (normals != nil || packNrm != nil);
 	int32 numDir = 0;
 	V3d objDir[2];   // light directions rotated into atomic object space
 	RGBAf dirCol[2];
@@ -2079,20 +1968,8 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	}
 	u8 lightMask = GX_LIGHTNULL; // GX hardware lights are never used now
 
-	// Flush once per geometry, not per frame: the GP reads these arrays
-	// straight from RAM, but the CPU only writes them at stream time.
-	// Re-flushing every frame cost more than the indexed path saved.
-	// ponytail: direct-mapped table, collisions just re-flush (harmless).
-	bool32 needFlush = 1;
-	{
-		enum { FTAB = 512 };
-		static void *ftab[FTAB];
-		uint32 h = ((uintptr)geo >> 4) & (FTAB-1);
-		if(ftab[h] == geo)
-			needFlush = 0;
-		else
-			ftab[h] = geo;
-	}
+	// Allocation addresses are reused; cache this state on the geometry itself.
+	bool32 needFlush = !gpk->arraysFlushed;
 	// Indexed-attribute arrays: the GP DMA-fetches vertex data straight
 	// from these buffers, so the CPU streams 2-byte indices instead of
 	// full vertices. Only bind/flush when the indexed path is active —
@@ -2113,6 +1990,10 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		GX_SetArray(GX_VA_NRM, normals, sizeof(V3d));
 		if(needFlush)
 			DCFlushRange(normals, geo->numVertices*sizeof(V3d));
+	}else if(packNrm){
+		GX_SetArray(GX_VA_NRM, (void*)packNrm, 3);
+		if(needFlush)
+			DCFlushRange((void*)packNrm, geo->numVertices*3);
 	}
 	if(uv2){
 		GX_SetArray(GX_VA_TEX1, uv2, sizeof(TexCoords));
@@ -2133,6 +2014,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		if(needFlush)
 			DCFlushRange(uv, geo->numVertices*sizeof(TexCoords));
 	}
+	gpk->arraysFlushed = 1;
 
 	u8 prim = (geo->meshHeader->flags & MeshHeader::TRISTRIP) ?
 	    GX_TRIANGLESTRIP : GX_TRIANGLES;
@@ -2255,70 +2137,6 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		int ambR8 = clamp255i((int)(ambR*255.0f + 0.5f));
 		int ambG8 = clamp255i((int)(ambG*255.0f + 0.5f));
 		int ambB8 = clamp255i((int)(ambB*255.0f + 0.5f));
-#if GX_PROBE_SKIN
-		// Peds are the only geometry that reaches the GX hardware-lighting
-		// path: world geometry has no normals, so it takes the CPU ambient
-		// branch and its prelight carries the shading. That makes "peds are
-		// black" a question about exactly four inputs — material colour, the
-		// ambient register, the light colours, and the texel itself. Dump
-		// them once per skinned mesh, bounded, instead of A/B-ing four builds.
-		// Fires for any atomic carrying a Skin, not just successfully skinned
-		// ones: an empty log then means "no ped geometry reached the renderer
-		// at all", while skinned=0 lines mean the CPU skin path was rejected
-		// (hierarchy/bone mismatch). Without that split an empty log is
-		// ambiguous and costs a whole boot to disambiguate.
-		// Sample every mesh of one atomic per second, not one mesh per second:
-		// a ped is many meshes and only some render black, so a single
-		// arbitrary mesh per sample can't show which material is at fault.
-		// Latching the decision per atomic (m == 0) logs the whole breakdown
-		// of one character. Spacing by time makes the log span the intro
-		// cutscene *and* gameplay — the first N meshes are all cutscene, whose
-		// night lighting is legitimately near-zero.
-		static unsigned long long tProbe;
-		static bool32 probeThisAtomic;
-		if(m == 0)
-			probeThisAtomic = tProbe == 0 ||
-			    ticks_to_millisecs(gettime() - tProbe) >= 1000;
-		if(skin && gxProbeLeft > 0 && probeThisAtomic){
-			if(m == 0)
-				tProbe = gettime();
-			gxProbeLeft--;
-			uint32 gxFmt = 0xFF, firstWord = 0;
-			if(texture)
-				gxRasterProbe(texture->raster, &gxFmt, &firstWord);
-			char line[320];
-			snprintf(line, sizeof(line),
-			    "SKIN m=%d tx=%s skinned=%d geo=%p mat=%02x%02x%02x%02x amb=%.2f dif=%.2f "
-			    "nDir=%d mask=%02x ambL=%.2f,%.2f,%.2f dir0=%.2f,%.2f,%.2f "
-			    "hw=%d prelit=%d tex=%d fmt=%02x w0=%08x nv=%d nb=%d hier=%d "
-			    "lit=%d lit2=%d send=%d gflags=%08x world=%d",
-			    (int)m, texture ? texture->name : "-",
-			    (int)skinnedAtomic,
-			    (void*)geo, matcol.red, matcol.green, matcol.blue,
-			    matcol.alpha, surfAmb, surfDiff, (int)numDir, lightMask,
-			    lights.ambient.red, lights.ambient.green, lights.ambient.blue,
-			    numDir > 0 ? dirCol[0].red : 0.0f,
-			    numDir > 0 ? dirCol[0].green : 0.0f,
-			    numDir > 0 ? dirCol[0].blue : 0.0f,
-			    (int)hwLights, (int)prelitMesh, tex != nil,
-			    (unsigned)gxFmt, (unsigned)firstWord, (int)geo->numVertices,
-			    (int)skin->numBones, hier ? (int)hier->numNodes : -1,
-			    (int)lit, (int)lit2, (int)sendColor,
-			    (unsigned)geo->flags, rwworld != nil);
-			// SD file, not GeckoLog: Dolphin's emulated gecko truncates
-			// anything longer than a short line (every heartbeat in the
-			// capture is cut mid-string), which would silently shred exactly
-			// the fields being probed. libfat only commits on fclose, so
-			// open/append/close per line — bounded, so the cost is bounded.
-			DVD_FS_GUARD;
-			FILE *f = fopen("dvd:/skin.log", "a");
-			if(f){
-				fprintf(f, "%s\n", line);
-				fclose(f);
-			}
-			GeckoLog("SKIN probe written");
-		}
-#endif
 		// Material color, ambient and lights are all folded into the vertex
 		// color above, so none of them reach the GP any more. Passing white
 		// and no lights keeps the setup identical across every material in a
@@ -2346,10 +2164,11 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		       ambR8, ambG8, ambB8, matcol))
 			useIdx = 1;
 #endif
-		// Arm the env/rim stage for this mesh. Only when the geometry still
-		// owns float normals: packed world geometry freed its float arrays
-		// and never had normals to begin with, and the descriptor/emission
-		// pair below must agree with setup3DDraw about GX_VA_NRM.
+		// Arm the env/rim stage for this mesh whenever the geometry owns
+		// normals — gxPackGeometry keeps them (it only replaces positions and
+		// texcoords), and the emitters below take packed positions and float
+		// normals independently, so the descriptor/emission pair still agrees
+		// with setup3DDraw about GX_VA_NRM.
 		// The blend trigger the other backends compute per mesh
 		// (inst->vertexAlpha || m->color.alpha != 255). The material colour
 		// is baked into the vertex colours on this path, so the flag is the
@@ -2360,7 +2179,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		gxEnvTex = nil;
 		gxEnvUV2 = 0;
 		MatFX *mfx = mat ? MatFX::get(mat) : nil;
-		if(normals && !packPos){
+		if(normals || packNrm){
 			if(mfx && (mfx->type == MatFX::ENVMAP ||
 			           mfx->type == MatFX::BUMPENVMAP)){
 				Texture *envt = mfx->getEnvTexture();
@@ -2423,7 +2242,7 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		bool32 sendUV2 = gxEnvTex != nil && gxEnvUV2;
 		setup3DDraw(tex != nil, 0, 1, 0,
 		    makeRGBA(255, 255, 255, 255), 1.0f, nil, GX_LIGHTNULL,
-		    sendColor, useIdx, ambK, posFrac, uvFrac);
+		    sendColor, useIdx, ambK, posFrac, uvFrac, packNrm != nil);
 		if(useIdx){
 			GX_SetArray(GX_VA_POS, (void*)packPos, 3*sizeof(int16));
 			GX_SetArray(GX_VA_CLR0, gpk->colors, sizeof(RGBA));
@@ -2517,18 +2336,6 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 			}
 		}
 
-		gxLastPath = skinnedAtomic ? "3d-skin" : "3d";
-		gxLast.path = skinnedAtomic ? "3d-skin" : "3d";
-		gxLast.texName = texture ? texture->name : nil;
-		gxLast.texRaster = texture ? texture->raster : nil;
-		gxLast.texW = texture && texture->raster ? texture->raster->width : 0;
-		gxLast.texH = texture && texture->raster ? texture->raster->height : 0;
-		gxLast.hasTex = tex != nil;
-		gxLast.prim = prim;
-		gxLast.vtxfmt = 1;
-		gxLast.count = total;
-		gxLast.posFrac = posFrac;
-		gxLast.uvFrac = uvFrac;
 
 		uint32 start = 0;
 		while(start < total){
@@ -2570,9 +2377,14 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 				// normals but zero enumerated directionals (night, or a
 				// geometry without the NORMALS flag) would otherwise push an
 				// undeclared attribute and desync the FIFO — garbage geometry.
-				if(hwLights || sendNrm)
-					GX_Normal3f32(normals[vi].x, normals[vi].y,
-					    normals[vi].z);
+				if(hwLights || sendNrm){
+					if(packNrm){
+						const int8 *q = packNrm + 3*vi;
+						GX_Normal3s8(q[0], q[1], q[2]);
+					}else
+						GX_Normal3f32(normals[vi].x, normals[vi].y,
+						    normals[vi].z);
+				}
 				{
 #if !GX_WIREFRAME && !GX_UV_DEBUG
 				// With no directional contributing, the whole expression is
@@ -2635,7 +2447,13 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 					}
 					r += ambR; g += ambG; b += ambB;
 					for(int32 k = 0; k < numDir; k++){
-						V3d *n = &normals[vi];
+						V3d nn;
+						if(packNrm){
+							const int8 *q = packNrm + 3*vi;
+							nn.x = q[0]*(1.0f/64.0f); nn.y = q[1]*(1.0f/64.0f); nn.z = q[2]*(1.0f/64.0f);
+						}else
+							nn = normals[vi];
+						V3d *n = &nn;
 						float l = -(n->x*objDir[k].x + n->y*objDir[k].y +
 						    n->z*objDir[k].z);
 						if(l <= 0.0f)
@@ -2675,9 +2493,14 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 					else
 						GX_TexCoord2f32(uv ? uv[vi].u : 0.0f,
 						    uv ? uv[vi].v : 0.0f);
-					if(sendUV2)
-						GX_TexCoord2f32(uv2[vi].u, uv2[vi].v);
 				}
+				// The descriptor declares TEX1 whenever the dual pass is on, textured
+				// or not. A lightmapped mesh whose base texture failed to page in sent
+				// one attribute too few per vertex; the GP read vertex data as
+				// commands, stalled, and libogc parked the main thread at the FIFO
+				// high-water mark: the silent 1%-CPU freeze at scene changes.
+				if(sendUV2)
+					GX_TexCoord2f32(uv2[vi].u, uv2[vi].v);
 			}
 			GX_End();
 			if(start + count >= total)

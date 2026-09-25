@@ -53,6 +53,9 @@ Geometry::create(int32 numVerts, int32 numTris, uint32 flags)
 	for(int32 i = 0; i < 8; i++)
 		geo->texCoords[i] = nil;
 	geo->triangles = nil;
+	// NATIVE geometry skips the block below; a native reader that fails
+	// before filling this left destroy() freeing heap garbage (B180).
+	geo->attribBase = nil;
 	// Allocate all attributes at once. The triangle pointer
 	// will hold the first address (even when there are no triangles)
 	// so we can free easily.

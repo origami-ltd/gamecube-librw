@@ -28,11 +28,14 @@ void registerPlatformPlugins(void) { }
 #else
 
 #include <gccore.h>
+#include <ogc/arqueue.h>
 #include <malloc.h>
 // Texture/vertex buffers are MEM1, on BOTH targets. The GameCube has no
 // MEM2; routing them to the Wii's MEM2 made the dev build a 64MB fantasy
 // that could not represent the ship target (08-20). MEM1 pressure gets
 // solved in MEM1 or in ARAM, never here.
+extern "C" void *gcBigAlloc(size_t); extern "C" void gcBigFree(void*); extern "C" int gcBigContains(const void*);   // B79 big-block heap (gamecube.cpp)
+extern unsigned rwGeoAllocFails;   // geometry.cpp
 #define gxTexAlloc(sz) memalign(32, (sz))
 #define gxTexFree(p) free(p)
 
@@ -47,6 +50,7 @@ void CdStreamFsUnlock(void);
 // charged here instead; one allocated inside is already in the heap delta.
 void CStreamingTexBytes(long delta);
 int CStreamingMeasuring(void);
+extern volatile int gcOptionalAlloc;   // gamecube.cpp, B177: fail instead of shedding
 }
 namespace { struct DvdFsGuard {
 	DvdFsGuard(void) { CdStreamFsLock(); }
@@ -77,9 +81,23 @@ unsigned rwTexAllocFails;
 // what the streamer evicts, and that needs to be a measured change rather than
 // another blind one.
 unsigned gxTiledBytes;
+// ARAM tier counters (see gxAram below) and its LRU clock, which gx.cpp bumps
+// once per presented frame. Global like gxTiledBytes: the skeleton's census
+// reads them with a plain extern.
+unsigned gxAramBytes, gxWsBytes, gxWsPeak, gxPageIns, gxWsStarved, gxShareBytes, gxWsShared;
+unsigned gxAramStoreBytes;   // texel store capacity, for the streamer's ARAM pressure rule
+unsigned gxColorBytes;   // colour-cache arrays resident (gx.cpp)
+extern "C" { volatile unsigned gxDmaBusy; }   // MemoryWatcher: 1 while the main thread spins on an ARAM DMA
+unsigned gxSpills, gxWsFrameBytes, gxWsFramePeak;
+unsigned gxWsForced;   // B111: page-ins that had to GX_DrawDone and evict this frame's textures
+extern "C" void *__real_memalign(size_t, size_t);
+unsigned gxFrameNo;
+// Set by CTxdStore around a dictionary read: its texels stay in MEM1 instead
+// of the ARAM tier. fonts and hud — on screen every frame, drawn last, and
+// the first to starve when the window is full of the world (B30: HUD text
+// as solid blocks, 8325 starves).
+int gxTierExempt;
 
-extern unsigned gxTexBuilds; // global counter, defined in gx.cpp
-extern unsigned gxTileUs;    // CPU time spent tiling textures this frame
 #include <ogc/lwp_watchdog.h>
 
 namespace rw {
@@ -101,10 +119,432 @@ struct GxRaster
 	uint32 tiledSize;   // so the free path subtracts exactly what was added
 	bool32 tiledCharged; // whether that size went onto ms_memoryUsed
 	uint16 texFails; // consecutive tiling-alloc failures; gates the draw skip
+	// ARAM tier (see gxAram below): where the texels live when they are not
+	// in MEM1, the MEM1 window block they occupy while drawn, and the frame
+	// that last drew them — the LRU key.
+	uint32 aram;
+	uint32 wsAddr;
+	uint32 lastFrame;
+	bool32 spill;      // wsAddr is a heap block (window was full), freed two frames on
+	uint8 tlutSlot;      // B90: CI8 palette slot (GX_TLUT0+n)
+	uint8 tlutDirty;
 };
 
 int32 nativeRasterOffset;
 bool32 gxTexCacheDirty;
+#define GETGXRASTEREXT(raster) PLUGINOFFSET(GxRaster, raster, nativeRasterOffset)
+
+// ---------------------------------------------------------------------------
+// ARAM texel tier.
+//
+// The GameCube has 24MB of MEM1 and 16MB of ARAM, and the GP samples textures
+// from MEM1 only; ARAM is reachable by DMA alone. dca3 fits Vice City in 16MB
+// of Dreamcast RAM because every texture lives in a separate 8MB of VRAM
+// (vendor/librw/src/dc/alloc.cpp there); this is the same split on this
+// hardware: a native texture's tiled texels go to ARAM at load — the MEM1
+// copy is freed in the same call, so the streamer's heap delta never sees
+// them — and come back through a fixed MEM1 window only while something
+// draws them. The window is an LRU keyed by the frame that last bound the
+// texture; nothing bound in the last two frames is ever evicted, because the
+// GP may still be reading it. The ARAM budget leaves room for the audio bank
+// that returns later (ADPCM, [[aram-is-full-of-audio]]).
+//
+// ponytail: first-fit spans with coalescing, one array each, no defrag. The
+// ARAM side sees churn only through the streamer (a few textures a second);
+// the MEM1 window churns per camera turn, and a full scan of ~2000 spans per
+// page-in is well under the DMA it precedes.
+#if defined(RW_GAMECUBE) && !defined(HW_RVL)   // librw never sees the game's GTA_OGC
+#define GX_ARAM_TIER 1
+#else
+#define GX_ARAM_TIER 0
+#endif
+
+
+#if GX_ARAM_TIER
+#include <ogc/aram.h>
+#include <ogc/cache.h>
+
+enum {
+	GX_WS_BYTES     = 3072*1024,   // B85: 3.5MB -> 3MB; twins now share window blocks (B84)   // MEM1 window: what one frame can draw. 3MB starved the
+	                               // cutscene characters (per-frame set 3.2MB+, spills need heap
+	                               // the audio had taken) — B40 back to 3.5MB; audio pays instead.
+	GX_ARAM_RESERVE = 5220*1024,   // audio: ADPCM bank 3835K + seven ped-comment slots 553K + three 256K stream rings (B68) = 5156K measured; B114: was 5600K, 380K of texel store given back
+	GX_SPAN_GRAIN   = 32           // ARAM DMA and GX texture alignment
+};
+
+struct GxSpans
+{
+	struct Span { uint32 addr, size; bool32 used; };
+	Span *spans;
+	int32 count, cap;
+	uint32 used;
+
+	bool init(uint32 base, uint32 size, int32 capacity){
+		spans = (Span*)malloc(sizeof(Span)*capacity);
+		if(spans == nil) return false;
+		spans[0].addr = base; spans[0].size = size; spans[0].used = 0;
+		count = 1; cap = capacity; used = 0;
+		return true;
+	}
+	uint32 alloc(uint32 size){
+		size = (size + GX_SPAN_GRAIN-1) & ~(GX_SPAN_GRAIN-1);
+		for(int32 i = 0; i < count; i++){
+			Span *sp = &spans[i];
+			if(sp->used || sp->size < size) continue;
+			// Table full: take the whole span rather than refuse, which pushed the
+			// texture onto the MEM1 heap.
+			if(sp->size > size && count < cap){
+				memmove(sp+2, sp+1, sizeof(Span)*(count-i-1));
+				sp[1].addr = sp->addr + size; sp[1].size = sp->size - size; sp[1].used = 0;
+				sp->size = size; count++;
+			}
+			sp->used = 1; used += sp->size;
+			return sp->addr;
+		}
+		return 0;
+	}
+	void release(uint32 addr){
+		for(int32 i = 0; i < count; i++){
+			if(spans[i].addr != addr || !spans[i].used) continue;
+			spans[i].used = 0; used -= spans[i].size;
+			if(i+1 < count && !spans[i+1].used){
+				spans[i].size += spans[i+1].size;
+				memmove(&spans[i+1], &spans[i+2], sizeof(Span)*(count-i-2)); count--;
+			}
+			if(i > 0 && !spans[i-1].used){
+				spans[i-1].size += spans[i].size;
+				memmove(&spans[i], &spans[i+1], sizeof(Span)*(count-i-1)); count--;
+			}
+			return;
+		}
+	}
+};
+
+static GxSpans gxAram, gxWs;
+static int32 gxTierState;          // 0 untried, 1 ready, -1 refused
+static Raster **gxWsList;          // rasters currently holding a window block
+static int32 gxWsCount, gxWsCap;
+
+static bool
+gxTierInit(void)
+{
+	if(gxTierState) return gxTierState > 0;
+	gxTierState = -1;
+	if(!AR_CheckInit()){
+		// Same array size as sampman's for the same reason: whoever runs
+		// first sizes AR_Alloc's block table for every user.
+		static u32 aramBlocks[300];
+		AR_Init(aramBlocks, 300);
+	}
+	ARQ_Init();
+	uint32 avail = AR_GetSize() - AR_GetBaseAddress();
+	printf("ARAM tier: AR size %u base %08X\n", AR_GetSize(), AR_GetBaseAddress());
+	if(avail <= GX_ARAM_RESERVE + 1024*1024){ printf("ARAM tier: refused, avail %uK\n", avail/1024); return false; }
+	uint32 size = avail - GX_ARAM_RESERVE;
+	uint32 base = AR_Alloc(size);
+	if(base == 0){ printf("ARAM tier: AR_Alloc failed\n"); return false; }
+	void *win = memalign(GX_SPAN_GRAIN, GX_WS_BYTES);
+	if(win == nil){ printf("ARAM tier: no MEM1 for the window\n"); return false; }
+	gxWsCap = 2048;
+	gxWsList = (Raster**)malloc(sizeof(Raster*)*gxWsCap);
+	gxAramStoreBytes = size;
+	if(gxWsList == nil || !gxAram.init(base, size, 6144) ||
+	   !gxWs.init((uint32)win, GX_WS_BYTES, 2048)){
+		printf("ARAM tier: span tables failed\n");
+		return false;
+	}
+	printf("ARAM tier: %uK texels at %08X, MEM1 window %uK\n",
+	    size/1024, base, GX_WS_BYTES/1024);
+	gxTierState = 1;
+	return true;
+}
+
+static void
+gxAramTransfer(uint32 direction, void *mram, uint32 aram, uint32 size)
+{
+	ARQRequest request;
+	gxDmaBusy = 1;
+	// AESND shares this queue; direct DMA bypasses its completion tracking.
+	ARQ_PostRequest(&request, 0x47585458, direction, ARQ_PRIO_LO,
+	    aram, (u32)MEM_VIRTUAL_TO_PHYSICAL(mram), size);
+	gxDmaBusy = 0;
+}
+
+// Move a freshly read tiled blob to ARAM and drop the MEM1 copy.
+static bool
+gxAramStore(GxRaster *ext, uint32 size)
+{
+	static int said;
+	if(said++ == 0) printf("ARAM tier: first native texture, %u bytes\n", size);
+	if(!gxTierInit()) return false;
+	uint32 a = gxAram.alloc(size);
+	if(a == 0) return false;
+	DCFlushRange(ext->tiled, size);
+	gxAramTransfer(ARQ_MRAMTOARAM, ext->tiled, a, size);
+	free(ext->tiled);
+	ext->tiled = nil;
+	ext->aram = a;
+	::gxAramBytes += size;
+	return true;
+}
+
+static void
+gxWsDrop(Raster *raster)
+{
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	if(ext->wsAddr == 0) return;
+	if(ext->spill){
+		if(gcBigContains((void*)ext->wsAddr)) gcBigFree((void*)ext->wsAddr); else free((void*)ext->wsAddr);
+		ext->spill = 0;
+	}else{
+		// B84: rasters that share ARAM texels (B74) share the window block too;
+		// the block goes back only with its last user.
+		bool32 shared = 0;
+		for(int32 i = 0; i < gxWsCount && !shared; i++)
+			if(gxWsList[i] != raster && GETGXRASTEREXT(gxWsList[i])->wsAddr == ext->wsAddr) shared = 1;
+		if(!shared){
+			gxWs.release(ext->wsAddr);
+			::gxWsBytes -= ext->tiledSize;
+		}
+	}
+	ext->wsAddr = 0;
+	for(int32 i = 0; i < gxWsCount; i++)
+		if(gxWsList[i] == raster){
+			gxWsList[i] = gxWsList[--gxWsCount];
+			break;
+		}
+}
+
+// Oldest window occupant not bound this frame, or nil.
+static Raster*
+gxWsVictim(bool32 force)
+{
+	Raster *best = nil; uint32 bestFrame = 0;
+	for(int32 i = 0; i < gxWsCount; i++){
+		GxRaster *e = GETGXRASTEREXT(gxWsList[i]);
+		// Only this frame's textures are pinned (B64): showRaster syncs the GP
+		// before the next frame starts, so last frame's blocks are free to reuse.
+		// Pinning two frames left no victims once a frame's set filled the window
+		// (starve 180/s, textures drawn black).
+		// B111: after a GX_DrawDone the pin is void — everything issued so far
+		// has been drawn — so the caller may force this frame's textures too.
+		if(e->spill || (!force && e->lastFrame + 1 > ::gxFrameNo)) continue;
+		if(best == nil || e->lastFrame < bestFrame){ best = gxWsList[i]; bestFrame = e->lastFrame; }
+	}
+	return best;
+}
+
+// B90: CI8 textures (ci8pack.py, lossless RGB5A3 palettes) bind through a
+// TLUT. 16 slots of 256 entries in TMEM, handed out round-robin; the palette
+// rides at the end of the window block, so a page-in brings it along.
+static Raster *gxTlutOwner[16];
+static uint32 gxTlutNext;
+static void
+gxInitWindowTexObj(Raster *raster, GxRaster *ext, uint32 blk)
+{
+	if(ext->gxFmt == GX_TF_CI8){
+		if(ext->tlutSlot == 0xFF || gxTlutOwner[ext->tlutSlot] != raster){
+			ext->tlutSlot = (uint8)(gxTlutNext++ & 15);
+			gxTlutOwner[ext->tlutSlot] = raster;
+		}
+		GX_InitTexObjCI(&ext->obj, (void*)blk, raster->width, raster->height,
+		    GX_TF_CI8, GX_CLAMP, GX_CLAMP, GX_FALSE, GX_TLUT0 + ext->tlutSlot);
+		ext->tlutDirty = 1;
+	}else
+		GX_InitTexObj(&ext->obj, (void*)blk, raster->width, raster->height,
+		    ext->gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
+	    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+}
+// Called at every bind of a CI8 raster: load its palette into its slot unless
+// the slot still holds it.
+static void
+gxBindTlut(Raster *raster, GxRaster *ext)
+{
+	if(ext->gxFmt != GX_TF_CI8 || ext->wsAddr == 0) return;
+	if(gxTlutOwner[ext->tlutSlot] != raster){
+		ext->tlutSlot = (uint8)(gxTlutNext++ & 15);
+		gxTlutOwner[ext->tlutSlot] = raster;
+		GX_InitTexObjTlut(&ext->obj, GX_TLUT0 + ext->tlutSlot);
+		ext->tlutDirty = 1;
+	}
+	if(ext->tlutDirty){
+		GXTlutObj tlut;
+		GX_InitTlutObj(&tlut, (void*)(ext->wsAddr + (uint32)raster->width*raster->height), GX_TL_RGB5A3, 256);
+		GX_LoadTlut(&tlut, GX_TLUT0 + ext->tlutSlot);
+		ext->tlutDirty = 0;
+	}
+}
+
+// Bring an ARAM-resident texture into the MEM1 window for drawing.
+extern "C" { extern volatile const char *gMainWhere; }
+static bool
+gxPageIn(Raster *raster, GxRaster *ext)
+{
+	gMainWhere = "page-in";
+	uint32 size = ext->tiledSize;
+	// B84: a twin raster (same ARAM span, B74 dedupe) already in the window
+	// means no DMA and no new block: point at its texels.
+	for(int32 i = 0; i < gxWsCount && gxWsCount < gxWsCap; i++){
+		GxRaster *o = GETGXRASTEREXT(gxWsList[i]);
+		if(o->aram == ext->aram && o->wsAddr && !o->spill && o->tiledSize == size){
+			gxInitWindowTexObj(raster, ext, o->wsAddr);
+			ext->wsAddr = o->wsAddr;
+			ext->spill = 0;
+			gxWsList[gxWsCount++] = raster;
+			::gxWsShared++;
+			return true;
+		}
+	}
+	uint32 blk = gxWs.alloc(size);
+	bool32 spill = 0, forced = 0;
+	while(blk == 0){
+		Raster *victim = gxWsVictim(forced);
+		if(victim == nil && !forced && gxWsCount > 0){
+			// B111: the window holds only this frame's textures (or is too
+			// fragmented for this block). Let the GPU finish everything issued
+			// so far; then this frame's earlier textures are victims too, and
+			// the draw stays textured instead of starving. One stall per
+			// starvation, counted as `forced`; b110 had 1352 untextured draws
+			// and 2700 heap emergencies from the spill path below.
+			GX_DrawDone();
+			forced = 1;
+			::gxWsForced++;
+			continue;
+		}
+		if(victim == nil || gxWsCount >= gxWsCap){
+			// Window full of this frame's textures: borrow from the heap for
+			// two frames rather than draw untextured. Counted, so a window
+			// that is too small shows up as `spill` instead of as a glitch.
+			blk = (uint32)gcBigAlloc(size);   // B79: spills come from the big-block chunks, not the general heap
+			// B111: __real_memalign, not the wrapped one — a failed spill used
+			// to enter gcHeapFail (emergency shed + arena carve) every time.
+			if(blk == 0) blk = (uint32)__real_memalign(GX_SPAN_GRAIN, size);
+			if(blk == 0){
+				::gxWsStarved++;
+				return false;
+			}
+			spill = 1;
+			::gxSpills++;
+			break;
+		}
+		gxWsDrop(victim);
+		blk = gxWs.alloc(size);
+	}
+	// Any cache line of the previous occupant must go before the DMA lands,
+	// or a later write-back would put stale bytes over the new texels.
+	DCInvalidateRange((void*)blk, size);
+	gxAramTransfer(ARQ_ARAMTOMRAM, (void*)blk, ext->aram, size);
+	gxInitWindowTexObj(raster, ext, blk);
+	// The block may have held another texture two frames ago and TMEM may
+	// still cache it by address: invalidate now, mid-frame, not at the next
+	// beginUpdate.
+	GX_InvalidateTexAll();
+	ext->wsAddr = blk;
+	ext->spill = spill;
+	gxWsList[gxWsCount++] = raster;
+	if(!spill){
+		::gxWsBytes += size;
+		if(::gxWsBytes > ::gxWsPeak) ::gxWsPeak = ::gxWsBytes;
+	}
+	::gxPageIns++;
+	return true;
+}
+
+// Once per presented frame (gx.cpp showRaster): measure the frame's texture
+// set — what the window must hold — and return spill blocks the GP is done
+// with (two frames old).
+void
+gxTierFrameEnd(void)
+{
+	uint32 done = ::gxFrameNo - 1;
+	uint32 bytes = 0;
+	for(int32 i = 0; i < gxWsCount; i++){
+		GxRaster *e = GETGXRASTEREXT(gxWsList[i]);
+		if(e->lastFrame == done) bytes += e->tiledSize;
+	}
+	::gxWsFrameBytes = bytes;
+	if(bytes > ::gxWsFramePeak) ::gxWsFramePeak = bytes;
+	for(int32 i = 0; i < gxWsCount; ){
+		GxRaster *e = GETGXRASTEREXT(gxWsList[i]);
+		if(e->spill && e->lastFrame + 2 <= ::gxFrameNo)
+			gxWsDrop(gxWsList[i]);   // swaps the tail in; re-check this slot
+		else
+			i++;
+	}
+}
+
+// ARAM texel sharing (B74). 52% of the archive's texel bytes are exact
+// duplicates across TXDs (white128a x56, road2_256 x38, ...). Every native
+// texture is hashed as it streams to ARAM; a duplicate of a resident blob gives
+// its span back and points at the resident one, refcounted. ARAM effectively
+// doubles; the disc bytes are still read (a shared TXD on disc is the next step).
+struct GxShare { uint64 hash; uint32 aram, size; uint16 refs; uint16 fmt; };
+enum { GX_SHARE_N = 4096 };
+static GxShare gxShare[GX_SHARE_N];
+static inline uint64 gxHashInit(void) { return 14695981039346656037ull; }
+static inline uint64 gxHashBytes(uint64 h, const uint8 *p, uint32 n)
+{
+	for(uint32 i = 0; i < n; i += 4){   // every 4th byte: 8x cheaper, still content-defined with the full size in the key
+		h ^= p[i]; h *= 1099511628211ull;
+	}
+	return h;
+}
+static GxShare *gxShareFind(uint64 hash, uint32 size, uint16 fmt)
+{
+	uint32 i = (uint32)(hash ^ (hash >> 32)) % GX_SHARE_N;
+	for(uint32 k = 0; k < 64; k++, i = (i + 1) % GX_SHARE_N){
+		GxShare *e = &gxShare[i];
+		if(e->refs == 0) return nil;
+		if(e->hash == hash && e->size == size && e->fmt == fmt) return e;
+	}
+	return nil;
+}
+static GxShare *gxShareInsert(uint64 hash, uint32 aram, uint32 size, uint16 fmt)
+{
+	uint32 i = (uint32)(hash ^ (hash >> 32)) % GX_SHARE_N;
+	for(uint32 k = 0; k < 64; k++, i = (i + 1) % GX_SHARE_N){
+		GxShare *e = &gxShare[i];
+		if(e->refs == 0){ e->hash = hash; e->aram = aram; e->size = size; e->fmt = fmt; e->refs = 1; return e; }
+	}
+	return nil;   // table region full: this texture is simply not shared
+}
+// true = the span is still in use by another raster (do not free it)
+static bool gxShareRelease(uint32 aram)
+{
+	for(uint32 i = 0; i < GX_SHARE_N; i++){
+		GxShare *e = &gxShare[i];
+		if(e->refs && e->aram == aram){
+			if(--e->refs == 0){ e->hash = 0; e->aram = 0; return false; }
+			gxShareBytes -= e->size;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+gxAramRelease(Raster *raster, GxRaster *ext)
+{
+	if(ext->wsAddr) gxWsDrop(raster);
+	if(ext->aram){
+		if(gxShareRelease(ext->aram)){   // still referenced by another raster
+			ext->aram = 0; ext->tiledSize = 0;
+			return;
+		}
+		gxAram.release(ext->aram);
+		::gxAramBytes -= ext->tiledSize;
+		ext->aram = 0;
+		ext->tiledSize = 0;
+	}
+}
+#else
+static inline bool gxAramStore(GxRaster*, uint32) { return false; }
+static inline bool gxPageIn(Raster*, GxRaster*) { return false; }
+static inline void gxAramRelease(Raster*, GxRaster*) {}
+static inline void gxBindTlut(Raster*, GxRaster*) {}   // Wii: no ARAM rasters, so no CI8 window binds
+void gxTierFrameEnd(void) {}
+#endif
 
 // Per-geometry display lists: one recorded FIFO block per mesh. Replaying
 // costs the GP a DMA and the CPU nothing, which is the whole point — the
@@ -133,6 +573,7 @@ destroyGeoExt(void *object, int32 offset, int32)
 	free(g->lists);
 	free(g->sizes);
 	rwFree(g->packBase);
+	if(g->colors) ::gxColorBytes -= g->colorCount*sizeof(RGBA);
 	rwFree(g->colors);
 	memset(g, 0, sizeof(*g));
 	return object;
@@ -192,6 +633,14 @@ gxQuant(float v, int shift)
 // Only called on streamed world geometry. Anything the game mutates after load
 // keeps its float arrays: CWaterLevel rewrites the wavy geometry's vertices
 // every frame, and skinned vertices are rebuilt every frame by definition.
+// GX_S8 normals carry a fixed 6 fraction bits: 1.0 is stored as 64.
+static inline int8
+gxQuantS8(float v)
+{
+	float q = v*64.0f + (v < 0.0f ? -0.5f : 0.5f);
+	return (int8)(q > 127.0f ? 127 : q < -127.0f ? -127 : (int)q);
+}
+
 void
 gxPackGeometry(Geometry *geo)
 {
@@ -200,22 +649,18 @@ gxPackGeometry(Geometry *geo)
 	GxGeoExt *g = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
 	if(g->packed & GXPACK_TRIED)
 		return;
+	g->arraysFlushed = 0;
 	g->packed |= GXPACK_TRIED;
 	if(geo->numMorphTargets != 1 || geo->morphTargets == nil)
 		return;
 	if(Skin::get(geo))
 		return;
-	// Packing frees the float arrays including the normals, and the env
-	// stage in atomicRenderCB is gated on `normals && !packPos` — so a
-	// reflective floor kept its shine only until the pack ran, then went
-	// matte. With the streamer churning interiors in and out of the 24MB
-	// budget, those floors BLINKED between shiny and dark. Env-mapped world
-	// meshes are few and small: keep their floats, keep the shine stable.
-	for(int32 i = 0; i < geo->matList.numMaterials; i++){
-		MatFX *mfx = MatFX::get(geo->matList.materials[i]);
-		if(mfx && (mfx->type == MatFX::ENVMAP || mfx->type == MatFX::BUMPENVMAP))
-			return;
-	}
+	// Env-mapped meshes pack too. The refusal that used to sit here existed
+	// only because the env stage in atomicRenderCB was gated on unpacked
+	// positions; packing keeps the float normals the texgen needs (the
+	// memmove below preserves them), so that gate is now just `normals`.
+	// Vehicles are all env-mapped, and at ~25 models resident they were the
+	// largest unpacked geometry left — 20 float bytes a vertex down to 10.
 
 	MorphTarget *mt = &geo->morphTargets[0];
 	V3d *verts = mt->vertices;
@@ -223,6 +668,7 @@ gxPackGeometry(Geometry *geo)
 		return;
 	int32 n = geo->numVertices;
 	TexCoords *uv = geo->numTexCoordSets == 1 ? geo->texCoords[0] : nil;
+	V3d *nrm = mt->normals;
 
 	// Both blocks must have the exact layout Geometry::create built, or the
 	// pointer arithmetic below is writing into someone else's data. Check the
@@ -262,7 +708,12 @@ gxPackGeometry(Geometry *geo)
 
 	size_t posSz = ps >= 0 ? (size_t)n*3*sizeof(int16) : 0;
 	size_t uvSz  = ts >= 0 ? (size_t)n*2*sizeof(int16) : 0;
-	uint8 *blk = (uint8*)rwMalloc(posSz + uvSz, MEMDUR_EVENT | ID_GEOMETRY);
+	// Normals go int8 alongside (dca3 packs them the same way): 3 bytes a
+	// vertex against 12, and the morph block then shrinks to its header.
+	// ponytail: only when positions pack too — a geometry that keeps float
+	// positions keeps float normals, so the morph block has one shape each way.
+	size_t nrmSz = (ps >= 0 && nrm) ? (size_t)n*3 : 0;
+	uint8 *blk = (uint8*)rwMalloc(posSz + uvSz + nrmSz, MEMDUR_EVENT | ID_GEOMETRY);
 	if(blk == nil)
 		return;              // non-must: staying on the float path is correct
 	g->packBase = blk;
@@ -288,6 +739,16 @@ gxPackGeometry(Geometry *geo)
 		}
 		g->packed |= GXPACK_UV;
 	}
+	if(nrmSz){
+		int8 *q = (int8*)(blk + posSz + uvSz);
+		g->nrm = q;
+		for(int32 i = 0; i < n; i++){
+			*q++ = gxQuantS8(nrm[i].x);
+			*q++ = gxQuantS8(nrm[i].y);
+			*q++ = gxQuantS8(nrm[i].z);
+		}
+		g->packed |= GXPACK_NRM;
+	}
 
 	// Release what we just replaced. Shrinking reallocs only: the block can
 	// never end up larger than it started, so this eases fragmentation rather
@@ -295,18 +756,21 @@ gxPackGeometry(Geometry *geo)
 	if(g->packed & GXPACK_POS){
 		size_t keep = sizeof(MorphTarget);
 		size_t vertSz = (size_t)n*sizeof(V3d);
-		if(mt->normals){
+		bool keepNrm = mt->normals != nil && !(g->packed & GXPACK_NRM);
+		if(keepNrm){
 			memmove(mbase + keep, mbase + keep + vertSz, vertSz);
 			keep += vertSz;
 		}
 		gxPackSaved += (uint32)vertSz;
+		if(g->packed & GXPACK_NRM)
+			gxPackSaved += (uint32)(vertSz - (size_t)n*3);
 		uint8 *shrunk = (uint8*)rwRealloc(mbase, keep, MEMDUR_EVENT | ID_GEOMETRY);
 		if(shrunk)
 			mbase = shrunk;
 		geo->morphTargets = (MorphTarget*)mbase;
 		mt = &geo->morphTargets[0];
 		mt->vertices = nil;
-		mt->normals = mt->normals ? (V3d*)(mbase + sizeof(MorphTarget)) : nil;
+		mt->normals = keepNrm ? (V3d*)(mbase + sizeof(MorphTarget)) : nil;
 	}
 	if(g->packed & GXPACK_UV){
 		gxPackSaved += (uint32)((size_t)n*sizeof(TexCoords));
@@ -324,13 +788,174 @@ gxPackGeometry(Geometry *geo)
 	gxPackGeoms++;
 }
 
+// B178: GameCube native geometry, written offline by tools/gamecube/dffnative.py:
+// gxPackGeometry's output computed on the host. Positions and uv0 are the
+// packer's int16 arrays, read straight into the packed block; normals turn
+// int8 on the way in, colours land in the attribute block. No float arrays
+// ever exist, so the 100-180K transient blocks Geometry::create asked for —
+// the allocation that failed on a fragmented heap and left big buildings at
+// LOD for good — are gone, and the DFF on the disc is about half the size.
+// The geometry leaves here exactly as a packed generic one, NATIVE cleared.
+enum { GXNAT_POS = 1, GXNAT_NORMAL = 2, GXNAT_COLOR = 4, GXNAT_UV0 = 8, GXNAT_UV2 = 16 };
+uint32 gxNativeGeoms;
+static void gxNativeFail(const char *why, uint32 a, uint32 b);
+
+Stream*
+gxReadNativeGeometry(Stream *stream, int32 len, void *object, int32, int32)
+{
+	Geometry *geo = (Geometry*)object;
+	uint32 size, version;
+	if(!findChunk(stream, ID_STRUCT, &size, &version) || size < 24){
+		gxNativeFail("geo-struct", size, 0);
+		return nil;
+	}
+	uint32 meta[6];   // platform, version, vertices, attributes, shifts, data bytes
+	stream->read32(meta, sizeof(meta));
+	uint32 n = meta[2], attr = meta[3], dataLen = meta[5];
+	size_t posSz = (size_t)n*6, pad = (4 - (posSz & 3)) & 3;
+	size_t expect = posSz + ((attr & (GXNAT_NORMAL|GXNAT_COLOR|GXNAT_UV0)) ? pad : 0) +
+	    ((attr & GXNAT_NORMAL) ? (size_t)n*12 : 0) + ((attr & GXNAT_COLOR) ? (size_t)n*4 : 0) +
+	    ((attr & GXNAT_UV0) ? (size_t)n*4 : 0);
+	if(meta[0] != PLATFORM_GAMECUBE || meta[1] != 1 || n != (uint32)geo->numVertices ||
+	   !(attr & GXNAT_POS) || (attr & GXNAT_UV2) || geo->numMorphTargets != 1 ||
+	   dataLen != expect || size != 24 + dataLen){
+		gxNativeFail("geo-meta", n, attr);
+		return nil;
+	}
+	GxGeoExt *g = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
+	size_t uvSz = (attr & GXNAT_UV0) ? (size_t)n*4 : 0, nrmSz = (attr & GXNAT_NORMAL) ? (size_t)n*3 : 0;
+	uint8 *blk = (uint8*)rwMalloc(posSz + uvSz + nrmSz, MEMDUR_EVENT | ID_GEOMETRY);
+	uint8 *col = (attr & GXNAT_COLOR) ? (uint8*)rwMalloc((size_t)n*4, MEMDUR_EVENT | ID_GEOMETRY) : nil;
+	if(blk == nil || ((attr & GXNAT_COLOR) && col == nil)){
+		rwFree(blk); rwFree(col);
+		rwGeoAllocFails++;
+		return nil;
+	}
+	stream->read16(blk, posSz);
+	if(pad && expect > posSz)
+		stream->seek(pad);
+	if(attr & GXNAT_NORMAL){
+		int8 *q = (int8*)(blk + posSz + uvSz);
+		float buf[3*128];
+		for(uint32 done = 0; done < n; ){
+			uint32 k = n - done < 128 ? n - done : 128;
+			stream->read32(buf, k*12);
+			for(uint32 i = 0; i < 3*k; i++)
+				*q++ = gxQuantS8(buf[i]);
+			done += k;
+		}
+	}
+	if(col)
+		stream->read8(col, (size_t)n*4);
+	if(uvSz)
+		stream->read16(blk + posSz, uvSz);
+
+	g->packBase = blk;
+	g->pos = (int16*)blk;
+	g->posShift = (uint8)(meta[4] & 0xFF);
+	g->packed = GXPACK_TRIED | GXPACK_POS;
+	if(uvSz){
+		g->uv = (int16*)(blk + posSz);
+		g->uvShift = (uint8)((meta[4] >> 8) & 0xFF);
+		g->packed |= GXPACK_UV;
+	}
+	if(nrmSz){
+		g->nrm = (int8*)(blk + posSz + uvSz);
+		g->packed |= GXPACK_NRM;
+	}
+	g->arraysFlushed = 0;
+	geo->attribBase = col;
+	geo->colors = (RGBA*)col;
+	for(int32 i = 0; i < 8; i++)
+		geo->texCoords[i] = nil;
+	geo->triangles = nil;
+	geo->numTriangles = 0;
+	geo->flags &= ~Geometry::NATIVE;
+	gxNativeGeoms++;
+	(void)len; (void)version;
+	return stream;
+}
+
+bool32
+gxMoveGeometryMemory(Geometry *geo, void *(*move)(void*), bool32 onlyOne)
+{
+	if(geo == nil || (geo->flags & Geometry::NATIVE) || Skin::get(geo)) return false;
+	GxGeoExt *g = PLUGINOFFSET(GxGeoExt, geo, gxGeoOffset);
+	bool32 changed = false;
+	uintptr old = (uintptr)geo->attribBase;
+	uint8 *p = (uint8*)move(geo->attribBase);
+	if((uintptr)p != old){
+		uintptr delta = (uintptr)p - old;
+		geo->attribBase = p;
+		if(geo->triangles) geo->triangles = (Triangle*)((uintptr)geo->triangles + delta);
+		if(geo->colors) geo->colors = (RGBA*)((uintptr)geo->colors + delta);
+		for(int i = 0; i < geo->numTexCoordSets; i++)
+			if(geo->texCoords[i]) geo->texCoords[i] = (TexCoords*)((uintptr)geo->texCoords[i] + delta);
+		g->arraysFlushed = 0; changed = true;
+		if(onlyOne) return true;
+	}
+	old = (uintptr)geo->morphTargets;
+	p = (uint8*)move(geo->morphTargets);
+	if((uintptr)p != old){
+		uintptr delta = (uintptr)p - old;
+		geo->morphTargets = (MorphTarget*)p;
+		for(int i = 0; i < geo->numMorphTargets; i++){
+			MorphTarget *m = &geo->morphTargets[i];
+			if(m->vertices) m->vertices = (V3d*)((uintptr)m->vertices + delta);
+			if(m->normals) m->normals = (V3d*)((uintptr)m->normals + delta);
+		}
+		g->arraysFlushed = 0; changed = true;
+		if(onlyOne) return true;
+	}
+	old = (uintptr)g->packBase;
+	p = (uint8*)move(g->packBase);
+	if((uintptr)p != old){
+		uintptr delta = (uintptr)p - old;
+		g->packBase = p;
+		if(g->pos) g->pos = (int16*)((uintptr)g->pos + delta);
+		if(g->uv) g->uv = (int16*)((uintptr)g->uv + delta);
+		if(g->nrm) g->nrm = (int8*)((uintptr)g->nrm + delta);
+		g->arraysFlushed = 0; changed = true;
+		if(onlyOne) return true;
+	}
+	old = (uintptr)geo->meshHeader;
+	if(g->colors){
+		RGBA *colors = (RGBA*)move(g->colors);
+		if(colors != g->colors){
+			g->colors = colors;
+			DCFlushRange(colors, g->colorCount*sizeof(RGBA));
+			changed = true;
+			if(onlyOne) return true;
+		}
+	}
+	p = (uint8*)move(geo->meshHeader);
+	if((uintptr)p != old){
+		uintptr delta = (uintptr)p - old;
+		geo->meshHeader = (MeshHeader*)p;
+		Mesh *meshes = geo->meshHeader->getMeshes();
+		for(int i = 0; i < geo->meshHeader->numMeshes; i++)
+			if(meshes[i].indices) meshes[i].indices = (uint16*)((uintptr)meshes[i].indices + delta);
+		changed = true;
+	}
+	return changed;
+}
+
 static void*
 copyGeoExt(void *dst, void *, int32 offset, int32)
 {
 	memset(PLUGINOFFSET(GxGeoExt, dst, offset), 0, sizeof(GxGeoExt));
 	return dst;
 }
-#define GETGXRASTEREXT(raster) PLUGINOFFSET(GxRaster, raster, nativeRasterOffset)
+
+// Tiled bytes one raster holds in MEM1, for the skeleton's OOM bill. C
+// linkage and a void* so the caller needs none of this file's types.
+extern "C" unsigned
+gcRasterTiledBytes(void *raster)
+{
+	if(raster == nil)
+		return 0;
+	return GETGXRASTEREXT((Raster*)raster)->tiledSize;
+}
 
 static void*
 createNativeRaster(void *object, int32 offset, int32)
@@ -344,6 +969,7 @@ static void*
 destroyNativeRaster(void *object, int32 offset, int32)
 {
 	GxRaster *ext = PLUGINOFFSET(GxRaster, object, offset);
+	gxAramRelease((Raster*)object, ext);
 	if(ext->tiled){
 		::gxTiledBytes -= ext->tiledSize;
 		if(ext->tiledCharged)
@@ -604,11 +1230,24 @@ gxGrabEFB(Raster *dst, int32 w, int32 h)
 	// RGB565: no alpha to preserve in a frame grab, half the bytes of RGBA8.
 	uint32 need = GX_GetTexBufferSize(w, h, GX_TF_RGB565, GX_FALSE, 0);
 	if(ext->tiled == nil || ext->tiledSize < need){
+		// B177: the grab is optional (rain drops, trails, scope). It no longer
+		// happens at boot for the colour filter, so it lands on a busy heap:
+		// take it only if it fits, never by shedding models, and after a miss
+		// wait a second before asking again.
+		static uint32 missFrame;
+		if(missFrame && ::gxFrameNo - missFrame < 60)
+			return 0;
 		if(ext->tiled)
 			gxTexFree(ext->tiled);
+		ext->hasTex = 0;
+		gcOptionalAlloc = 1;
 		ext->tiled = (void*)gxTexAlloc(need);
-		if(ext->tiled == nil)
+		gcOptionalAlloc = 0;
+		if(ext->tiled == nil){
+			missFrame = ::gxFrameNo ? ::gxFrameNo : 1;
 			return 0;
+		}
+		missFrame = 0;
 		ext->tiledSize = need;
 	}
 	// The CPU cache may hold lines over this buffer; a writeback after the
@@ -637,6 +1276,13 @@ gxGetTexture(Raster *raster)
 		return nil;
 
 	GxRaster *ext = GETGXRASTEREXT(raster);
+	if(ext->aram){
+		if(ext->wsAddr == 0 && !gxPageIn(raster, ext))
+			return nil;          // window full of this frame's textures: untextured once
+		ext->lastFrame = ::gxFrameNo;
+		gxBindTlut(raster, ext);
+		return &ext->obj;
+	}
 	// staging pixels are freed after tiling, so the cached-texture check must
 	// come before the pixels check
 	if(ext->hasTex && !ext->dirty)
@@ -663,6 +1309,8 @@ gxGetTexture(Raster *raster)
 	if(tw < align+1) tw = align+1;
 	if(th < align+1) th = align+1;
 	int32 size = cmpr ? tw*th/2 : tw*th*2;
+	if(ext->tiled == nil && ext->texFails && ext->lastFrame + 120 > ::gxFrameNo)
+		return nil;   // B91: a 600K motion-blur raster failing every frame dragged the emergency shed with it
 	if(ext->tiled == nil){
 		ext->tiled = gxTexAlloc(size);
 		if(ext->tiled){
@@ -685,38 +1333,16 @@ gxGetTexture(Raster *raster)
 			// the budget was being tuned against was invisible to the readout
 			// used to tune it.
 			::rwTexAllocFails++;
+			ext->lastFrame = ::gxFrameNo;
 			if(ext->texFails < 1000)
 				ext->texFails++;
-#if defined(GTA_OGC) && !defined(HW_RVL)
-			// The disc build's boot pin: name this failure and the memory
-			// state on the card, the one debug channel this target has.
-			{
-				static int said;
-				if(said < 4){
-					said++;
-					struct mallinfo mi = mallinfo();
-					FILE *df = fopen("mc:/diag2.bin", "wb");
-					if(df){
-						fprintf(df, "TEXALLOC fail %dx%d sz=%d free=%uK frags=%u fails=%u",
-						    (int)tw, (int)th, (int)size,
-						    (unsigned)(mi.fordblks>>10), (unsigned)mi.ordblks,
-						    (unsigned)::rwTexAllocFails);
-						fclose(df);
-					}
-				}
-			}
-#endif
 			return nil;
 		}
 	}
-	{
-		unsigned long long t0 = gettime();
-		if(cmpr)
-			tileCMPR((uint8*)ext->tiled, raster, tw, th);
-		else
-			tileRGB5A3((uint8*)ext->tiled, raster, tw, th);
-		::gxTileUs += (unsigned)ticks_to_microsecs(gettime() - t0);
-	}
+	if(cmpr)
+		tileCMPR((uint8*)ext->tiled, raster, tw, th);
+	else
+		tileRGB5A3((uint8*)ext->tiled, raster, tw, th);
 	DCFlushRange(ext->tiled, size);
 
 	GX_InitTexObj(&ext->obj, ext->tiled, tw, th,
@@ -736,7 +1362,6 @@ gxGetTexture(Raster *raster)
 	// (per-texture invalidation there floods the FIFO with no frame
 	// draining it).
 	gxTexCacheDirty = 1;
-	::gxTexBuilds++;
 	ext->texFails = 0;
 
 	// ponytail: plain textures never re-lock once drawn, and keeping both the
@@ -986,7 +1611,16 @@ rasterFromImageBody(Raster *raster, Image *image)
 // GX texture format ids as plain constants. The offline converter has to build
 // these same blobs on a host with no gccore.h, so nothing in the tiling or the
 // native-texture format may depend on the console headers.
-enum { GXFMT_RGB5A3 = 0x5, GXFMT_CMPR = 0xE };
+enum { GXFMT_IA4 = 0x2, GXFMT_RGB5A3 = 0x5, GXFMT_CMPR = 0xE };
+// Bytes of a tiled level-0 image in each native format: CMPR 4bpp, IA4 8bpp,
+// RGB5A3 16bpp. The offline converter (txdconv) sizes with the same rule.
+static inline uint32
+gxNativeSize(uint8 fmt, int32 tw, int32 th)
+{
+	return fmt == GXFMT_CMPR ? (uint32)tw*th/2 :
+	       fmt == GXFMT_IA4  ? (uint32)tw*th   :
+	       fmt == GX_TF_CI8   ? (uint32)tw*th + 512 : (uint32)tw*th*2;   // B90: CI8 carries its palette (ci8pack.py)
+}
 
 static void*
 gxAllocTiled(uint32 size)
@@ -1026,30 +1660,13 @@ gxFinishNativeRaster(Raster *raster, int32 tw, int32 th, uint32 size)
 // reader needs no knowledge of the source image at all.
 enum { GXNATIVE_HEADER = 88 };
 
-// Bounded log of why a native read gave up. A nil return here fails the whole
-// dictionary, and the streamer answers a failed load by requesting it again —
-// so one silent rejection becomes an endless retry that drains the heap while
-// streaming never advances. Worth naming the reason out loud.
-static int32 gxNativeLogLeft = 40;
+// Why a native read gave up: a nil return fails the whole dictionary, and the
+// streamer re-requests a failed load, so the reason is worth one line.
 static void
 gxNativeFail(const char *why, uint32 a, uint32 b)
 {
-	if(gxNativeLogLeft-- <= 0)
-		return;
-	char line[128];
-	snprintf(line, sizeof(line), "NATIVE fail %s a=%u b=%u", why, a, b);
-	DVD_FS_GUARD;
-	FILE *f = fopen("dvd:/native.log", "a");
-	if(f){ fprintf(f, "%s\n", line); fclose(f); }
-#if defined(GTA_OGC) && !defined(HW_RVL)
-	// The disc build cannot write native.log; the memory card is the one
-	// debug channel this target has. This line is what names the texture
-	// load the streamer retries forever.
-	f = fopen("mc:/diag.bin", "wb");
-	if(f){ fprintf(f, "%s", line); fclose(f); }
-#endif
+	printf("NATIVE fail %s a=%u b=%u\n", why, (unsigned)a, (unsigned)b);
 }
-
 Texture*
 readNativeTexture(Stream *stream)
 {
@@ -1092,7 +1709,7 @@ readNativeTexture(Stream *stream)
 	strncpy(tex->mask, (char*)&header[40], 32);
 
 	uint32 size = stream->readU32();
-	uint32 expect = gxFmt == GXFMT_CMPR ? (uint32)tw*th/2 : (uint32)tw*th*2;
+	uint32 expect = gxNativeSize(gxFmt, tw, th);
 	if(size != expect){
 		gxNativeFail("size", size, expect);
 		tex->destroy();
@@ -1107,6 +1724,68 @@ readNativeTexture(Stream *stream)
 		return nil;
 	}
 	GxRaster *ext = GETGXRASTEREXT(raster);
+	ext->tiledSize = size;
+	ext->gxFmt = gxFmt;
+#if GX_ARAM_TIER
+	if(filterAddressing & 0x80000000u){
+		// B89: shared-pool reference (tools/gamecube/sharedpool.py): no texels
+		// here, just the content hash of a texture models/shared.txd keeps
+		// resident in ARAM. Same table the B74 dedupe fills.
+		uint32 lo = stream->readU32(), hi = stream->readU32();
+		uint64 h = ((uint64)hi << 32) | lo;
+		GxShare *sh = gxShareFind(h, size, (uint16)gxFmt);
+		if(sh == nil){
+			gxNativeFail("shared-miss", hi, lo);
+			raster->destroy(); tex->destroy();
+			return nil;
+		}
+		tex->filterAddressing = filterAddressing & 0x7fffffffu;
+		ext->aram = sh->aram; sh->refs++; gxShareBytes += size;
+		GX_InitTexObj(&ext->obj, nil, tw, th, gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
+		    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+		ext->hasTex = 1;
+		ext->dirty = 0;
+		tex->raster = raster;
+		return tex;
+	}
+	// ARAM-bound texels never touch the heap: 32K pieces through one static
+	// staging buffer, each DMA'd as it lands. B42 lost a cutscene's dictionary
+	// to "NATIVE fail alloc 131072" — the old path wanted the whole texture in
+	// MEM1 first, on a heap at the floor.
+	uint32 a = (!::gxTierExempt && gxTierInit()) ? gxAram.alloc(size) : 0;
+	if(a){
+		gMainWhere = "tex-load";
+		static uint8 stage[32*1024] __attribute__((aligned(32)));
+		uint64 hash = gxHashInit();
+		for(uint32 done = 0; done < size; ){
+			uint32 chunk = size - done > sizeof(stage) ? (uint32)sizeof(stage) : size - done;
+			stream->read8(stage, chunk);
+			hash = gxHashBytes(hash, stage, chunk);
+			DCFlushRange(stage, chunk);
+			gxAramTransfer(ARQ_MRAMTOARAM, stage, a + done, chunk);
+			done += chunk;
+		}
+		hash ^= (uint64)size << 40 ^ (uint64)gxFmt << 56 ^ (uint64)tw << 16 ^ th;
+		GxShare *sh = gxShareFind(hash, size, (uint16)gxFmt);
+		if(sh){   // resident twin: give this span back, share the texels
+			gxAram.release(a);
+			a = sh->aram; sh->refs++; gxShareBytes += size;
+		}else{
+			gxShareInsert(hash, a, size, (uint16)gxFmt);
+			::gxAramBytes += size;
+		}
+		ext->aram = a;
+		GX_InitTexObj(&ext->obj, nil, tw, th, gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
+		    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+		ext->hasTex = 1;
+		ext->dirty = 0;
+		tex->raster = raster;
+		return tex;
+	}
+#endif
+	if(gxFmt == GX_TF_CI8){ gxNativeFail("ci8-mem1", tw, th); raster->destroy(); tex->destroy(); return nil; }   // B90: palettes bind only through the window
 	ext->tiled = gxAllocTiled(size);
 	if(ext->tiled == nil){
 		gxNativeFail("alloc", size, 0);
@@ -1116,7 +1795,14 @@ readNativeTexture(Stream *stream)
 	}
 	// Straight into its final home. No staging, no Image, no conversion.
 	stream->read8(ext->tiled, size);
-	ext->gxFmt = gxFmt;
+	// Count it. This path used to set neither tiledSize nor gxTiledBytes, so
+	// every ahead-of-time texture was invisible to the resident-texel figure
+	// the HUD and the death screen report ("tex 62K" on a heap holding the
+	// whole world's TXDs). Not charged to the streamer: streamed TXD loads are
+	// already measured as a heap delta (gResidentCost), and TXDs loaded
+	// outside streaming are the fixed set, which is exactly what this number
+	// must expose.
+	::gxTiledBytes += size;
 	gxFinishNativeRaster(raster, tw, th, size);
 	tex->raster = raster;
 	return tex;
@@ -1128,7 +1814,7 @@ writeNativeTexture(Texture *tex, Stream *stream)
 	Raster *raster = tex->raster;
 	GxRaster *ext = GETGXRASTEREXT(raster);
 	int32 tw = raster->width, th = raster->height;
-	uint32 size = ext->gxFmt == GXFMT_CMPR ? (uint32)tw*th/2 : (uint32)tw*th*2;
+	uint32 size = gxNativeSize(ext->gxFmt, tw, th);
 
 	writeChunkHeader(stream, ID_STRUCT, GXNATIVE_HEADER + 4 + size);
 	uint8 header[GXNATIVE_HEADER];
@@ -1155,9 +1841,7 @@ getSizeNativeTexture(Texture *tex)
 {
 	Raster *raster = tex->raster;
 	GxRaster *ext = GETGXRASTEREXT(raster);
-	uint32 size = ext->gxFmt == GXFMT_CMPR ?
-	    (uint32)raster->width*raster->height/2 :
-	    (uint32)raster->width*raster->height*2;
+	uint32 size = gxNativeSize(ext->gxFmt, raster->width, raster->height);
 	return 12 + GXNATIVE_HEADER + 4 + size;
 }
 

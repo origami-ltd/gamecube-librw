@@ -1,5 +1,6 @@
 #include <stdio.h>
 #ifdef RW_GAMECUBE
+extern "C" void gcOomReport(size_t);   // gamecube.cpp: heap census before the OOM exit
 #include <malloc.h>   // malloc_usable_size; not a thing on every host
 #endif
 #include <stdlib.h>
@@ -143,20 +144,28 @@ printleaks(void)
 void *mustmalloc_h(size_t sz, uint32 hint)
 {
 	void *ret;
+	const char *site = allocLocation;
 	ret = Engine::memfuncs.rwmalloc(sz, hint);
 	if(ret || sz == 0)
 		return ret;
-	fprintf(stderr, "Error: out of memory\n");
+#ifdef RW_GAMECUBE
+	gcOomReport(sz);
+#endif
+	fprintf(stderr, "Error: out of memory (%zu bytes at %s)\n", sz, site ? site : "unknown");
 	exit(1);
 	return nil;
 }
 void *mustrealloc_h(void *p, size_t sz, uint32 hint)
 {
 	void *ret;
+	const char *site = allocLocation;
 	ret = Engine::memfuncs.rwrealloc(p, sz, hint);
 	if(ret || sz == 0)
 		return ret;
-	fprintf(stderr, "Error: out of memory\n");
+#ifdef RW_GAMECUBE
+	gcOomReport(sz);
+#endif
+	fprintf(stderr, "Error: out of memory (%zu bytes at %s)\n", sz, site ? site : "unknown");
 	exit(1);
 	return nil;
 }

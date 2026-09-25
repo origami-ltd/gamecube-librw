@@ -555,7 +555,7 @@ struct Geometry
 	void calculateBoundingSphere(void);
 	bool32 hasColoredMaterial(void);
 	void allocateData(void);
-	MeshHeader *allocateMeshes(int32 numMeshes, uint32 numIndices, bool32 noIndices);
+	MeshHeader *allocateMeshes(int32 numMeshes, uint32 numIndices, bool32 noIndices, bool32 canFail = 0);
 	void generateTriangles(int8 *adc = nil);
 	void buildMeshes(void);
 	void dropTrianglesAfterInstancing(void);

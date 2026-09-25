@@ -77,8 +77,11 @@ struct GxGeoExt
 	void *packBase;
 	int16 *pos;               // 3 per vertex, stored value = float<<posShift
 	int16 *uv;                // 2 per vertex, stored value = float<<uvShift
+	int8  *nrm;               // 3 per vertex, GX_S8: float*64 (the GP's fixed 6 fraction bits)
 	uint8 posShift, uvShift;
 	uint8 packed;             // GXPACK_* bits
+	uint8 arraysFlushed;
+	uint32 colorFrame;        // frame the colour cache was last rebuilt
 	// Vertex colours, precomputed so the indexed path can exist at all.
 	//
 	// The immediate path computes clamp(prelight + ambient) * material per
@@ -92,12 +95,17 @@ struct GxGeoExt
 	// Costs 4 bytes a vertex against the 10 gxPackGeometry freed.
 	RGBA  *colors;
 	uint32 colorKey;          // ambient and material this was built for
+	uint32 colorAmbient;
 	int32  colorCount;
 };
-enum { GXPACK_POS = 1, GXPACK_UV = 2, GXPACK_TRIED = 4 };
+enum { GXPACK_POS = 1, GXPACK_UV = 2, GXPACK_TRIED = 4, GXPACK_NRM = 8 };
 // Quantise a streamed geometry in place. Call once, after the DFF has loaded
 // and before it is first drawn.
 void gxPackGeometry(Geometry *geo);
+// B178: PLATFORM_GAMECUBE native-data plugin (dffnative.py output).
+Stream *gxReadNativeGeometry(Stream *stream, int32 len, void *object, int32 o, int32 s);
+extern uint32 gxNativeGeoms;
+bool32 gxMoveGeometryMemory(Geometry *geo, void *(*move)(void*), bool32 onlyOne);
 extern uint32 gxPackSaved;    // running total of bytes reclaimed
 extern uint32 gxPackGeoms, gxPackRefusedPos, gxPackRefusedUV;
 extern int32 gxGeoOffset;
