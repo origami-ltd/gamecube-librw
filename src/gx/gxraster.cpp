@@ -1882,6 +1882,17 @@ readNativeTexture(Stream *stream)
 		tex->raster = raster;
 		return tex;
 	}
+	// The texel store is full. A world texture does not fall back to the MEM1
+	// heap: b192 put 1.9 MB of them there, the heap fragmented, the radio's
+	// decoder could no longer allocate and the game fell to 1 fps. The
+	// dictionary fails instead; the streamer's ARAM relief (Streaming.cpp)
+	// frees room and the model loads again later.
+	if(!::gxTierExempt && gxTierState > 0){
+		gxNativeFail("aram-full", size, ::gxAramBytes);
+		raster->destroy();
+		tex->destroy();
+		return nil;
+	}
 #endif
 	if(gxFmt == GX_TF_CI8){ gxNativeFail("ci8-mem1", tw, th); raster->destroy(); tex->destroy(); return nil; }   // B90: palettes bind only through the window
 	ext->tiled = gxAllocTiled(size);
