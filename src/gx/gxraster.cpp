@@ -30,10 +30,8 @@ void registerPlatformPlugins(void) { }
 #include <gccore.h>
 #include <ogc/arqueue.h>
 #include <malloc.h>
-// Texture/vertex buffers are MEM1, on BOTH targets. The GameCube has no
-// MEM2; routing them to the Wii's MEM2 made the dev build a 64MB fantasy
-// that could not represent the ship target (08-20). MEM1 pressure gets
-// solved in MEM1 or in ARAM, never here.
+// Texture/vertex buffers are MEM1. MEM1 pressure gets solved in MEM1 or in
+// ARAM, never here.
 extern "C" void *gcBigAlloc(size_t); extern "C" void gcBigFree(void*); extern "C" int gcBigContains(const void*);   // B79 big-block heap (gamecube.cpp)
 extern unsigned rwGeoAllocFails;   // geometry.cpp
 #define gxTexAlloc(sz) memalign(32, (sz))
@@ -153,7 +151,7 @@ bool32 gxTexCacheDirty;
 // ARAM side sees churn only through the streamer (a few textures a second);
 // the MEM1 window churns per camera turn, and a full scan of ~2000 spans per
 // page-in is well under the DMA it precedes.
-#if defined(RW_GAMECUBE) && !defined(HW_RVL)   // librw never sees the game's GTA_OGC
+#ifdef RW_GAMECUBE
 #define GX_ARAM_TIER 1
 #else
 #define GX_ARAM_TIER 0
@@ -542,7 +540,7 @@ gxAramRelease(Raster *raster, GxRaster *ext)
 static inline bool gxAramStore(GxRaster*, uint32) { return false; }
 static inline bool gxPageIn(Raster*, GxRaster*) { return false; }
 static inline void gxAramRelease(Raster*, GxRaster*) {}
-static inline void gxBindTlut(Raster*, GxRaster*) {}   // Wii: no ARAM rasters, so no CI8 window binds
+static inline void gxBindTlut(Raster*, GxRaster*) {}
 void gxTierFrameEnd(void) {}
 #endif
 

@@ -92,8 +92,7 @@ namespace gx {
 // so it cannot flood the FIFO or the frame. Peds are the only geometry on
 // the GX hardware-lighting path, so this is where "black characters" lives.
 // 1 = dump every input to the skinned (ped) draw to dvd:/skin.log, one sample
-// per second so the log spans the intro and gameplay. Read it back without
-// mounting: LC_ALL=C grep -a -o "SKIN [^|]*" WiiSD.raw
+// per second so the log spans the intro and gameplay.
 // debug: draw every mesh with its texture coordinate as colour (r=u, g=v),
 // untextured. Separates "the GP got the wrong UVs" from "the GP sampled the
 // texture wrongly" in one boot.
