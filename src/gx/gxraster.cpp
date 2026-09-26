@@ -90,6 +90,8 @@ unsigned gxSpills, gxWsFrameBytes, gxWsFramePeak;
 unsigned gxWsForced;   // B111: page-ins that had to GX_DrawDone and evict this frame's textures
 unsigned gxPageLevels[4];   // page-ins by first level: 0, 1, 2, 3+
 unsigned gxWsRetired;       // blocks swapped for a finer level mid-use
+unsigned gxAramSpills;      // native textures that found the store full with nothing left to free
+extern "C" int gcAramReclaim(unsigned bytes) __attribute__((weak));   // Streaming.cpp
 extern "C" void *__real_memalign(size_t, size_t);
 unsigned gxFrameNo;
 // Set by CTxdStore around a dictionary read: its texels stay in MEM1 instead
@@ -1852,6 +1854,13 @@ readNativeTexture(Stream *stream)
 	// to "NATIVE fail alloc 131072" — the old path wanted the whole texture in
 	// MEM1 first, on a heap at the floor.
 	uint32 a = (!::gxTierExempt && gxTierInit()) ? gxAram.alloc(size) : 0;
+	// A full store is a cache miss: the game frees what nothing draws
+	// (Streaming.cpp gcAramReclaim) until the span fits.
+	for(int32 k = 0; a == 0 && !::gxTierExempt && gxTierState > 0 && gcAramReclaim && k < 256; k++){
+		if(!gcAramReclaim(size))
+			break;
+		a = gxAram.alloc(size);
+	}
 	if(a){
 		gMainWhere = "tex-load";
 		static uint8 stage[32*1024] __attribute__((aligned(32)));
@@ -1882,16 +1891,17 @@ readNativeTexture(Stream *stream)
 		tex->raster = raster;
 		return tex;
 	}
-	// The texel store is full. A world texture does not fall back to the MEM1
-	// heap: b192 put 1.9 MB of them there, the heap fragmented, the radio's
-	// decoder could no longer allocate and the game fell to 1 fps. The
-	// dictionary fails instead; the streamer's ARAM relief (Streaming.cpp)
-	// frees room and the model loads again later.
+	// Nothing left to free in ARAM: last resort, the MEM1 heap, as before
+	// b193. Failing the dictionary instead left the intro's blocking load
+	// retrying one TXD for over a minute. Counted: a spill that shows up in
+	// play means the store is too small for what the scene draws.
 	if(!::gxTierExempt && gxTierState > 0){
-		gxNativeFail("aram-full", size, ::gxAramBytes);
-		raster->destroy();
-		tex->destroy();
-		return nil;
+		::gxAramSpills++;
+		static uint32 lastSaid;
+		if(::gxFrameNo - lastSaid > 60){
+			lastSaid = ::gxFrameNo;
+			printf("ARAM full: %u bytes into MEM1 (store %uK used, %u spills)\n", size, ::gxAramBytes/1024, ::gxAramSpills);
+		}
 	}
 #endif
 	if(gxFmt == GX_TF_CI8){ gxNativeFail("ci8-mem1", tw, th); raster->destroy(); tex->destroy(); return nil; }   // B90: palettes bind only through the window
