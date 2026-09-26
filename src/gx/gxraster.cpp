@@ -166,7 +166,7 @@ enum {
 	GX_WS_BYTES     = 3072*1024,   // B85: 3.5MB -> 3MB; twins now share window blocks (B84)   // MEM1 window: what one frame can draw. 3MB starved the
 	                               // cutscene characters (per-frame set 3.2MB+, spills need heap
 	                               // the audio had taken) — B40 back to 3.5MB; audio pays instead.
-	GX_ARAM_RESERVE = 5220*1024,   // audio: ADPCM bank 3835K + seven ped-comment slots 553K + three 256K stream rings (B68) = 5156K measured; B114: was 5600K, 380K of texel store given back
+	GX_ARAM_RESERVE = 4804*1024,   // audio: ADPCM bank 3835K + seven ped-comment slots 137K (ADPCM-sized, was 553K) + three 256K stream rings (B68) = 4740K; 64K margin as before
 	GX_SPAN_GRAIN   = 32           // ARAM DMA and GX texture alignment
 };
 
