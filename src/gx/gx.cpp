@@ -1236,7 +1236,7 @@ static void
 setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	RGBA matcol, float surfAmb, const RGBAf *ambLight, u8 lightMask,
 	bool32 sendColor, bool32 indexed = 0, RGBA ambAdd = {0,0,0,0},
-	u8 posFrac = 0xFF, u8 uvFrac = 0xFF, bool32 nrmS8 = 0)
+	u8 posFrac = 0xFF, u8 uvFrac = 0xFF, bool32 nrmS8 = 0, u8 fadeAlpha = 255)
 {
 	gxLastDraw = (textured?1:0) | (lit?2:0) | (prelit?4:0) | (haveNormals?8:0) | (sendColor?16:0) | (indexed?32:0) | (nrmS8?64:0) | (gxEnvTex?128:0) | (gxEnvUV2?256:0) | ((unsigned)lightMask << 16);
 	// stMaterialAlpha is set by the CALLER from the real material — the
@@ -1266,6 +1266,7 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	static void *mEnvTex;
 	static u32 mEnvK32;
 	static bool32 mEnvUV2;
+	static u8 mFade = 255;
 	u32 envK32 = ((u32)gxEnvK.r<<24)|((u32)gxEnvK.g<<16)|((u32)gxEnvK.b<<8)|gxEnvK.a;
 	RGBAf ambl = ambLight ? *ambLight : (RGBAf){0,0,0,0};
 	if(!gx3DMemoDirty && mT == textured && mL == lit && mP == prelit &&
@@ -1276,7 +1277,8 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	   *(uint32*)&mMat == *(uint32*)&matcol &&
 	   mAmbL.red == ambl.red && mAmbL.green == ambl.green &&
 	   mAmbL.blue == ambl.blue &&
-	   mEnvTex == (void*)gxEnvTex && mEnvK32 == envK32 && mEnvUV2 == gxEnvUV2){
+	   mEnvTex == (void*)gxEnvTex && mEnvK32 == envK32 && mEnvUV2 == gxEnvUV2 &&
+	   mFade == fadeAlpha){
 		applyBlend();
 		applyZMode();
 		applyAlphaTest();
@@ -1291,6 +1293,7 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 	mIdx = indexed; mAmbAdd = ambAdd; mTexOpaque = stTexOpaque;
 	mSend = sendColor;
 	mPosFrac = posFrac; mUvFrac = uvFrac; mNrmS8 = nrmS8;
+	mFade = fadeAlpha;
 
 	u8 attrMode = indexed ? GX_INDEX16 : GX_DIRECT;
 	GX_ClearVtxDesc();
@@ -1466,6 +1469,21 @@ setup3DDraw(bool32 textured, bool32 lit, bool32 prelit, bool32 haveNormals,
 		    GX_CC_CPREV);
 		GX_SetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO,
 		    GX_CA_APREV);
+		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
+		    GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
+		    GX_TRUE, GX_TEVPREV);
+		stage++;
+	}
+	// Material alpha for colours that come from the cache (gxBuildColorCache
+	// leaves it out): PREV.a *= K3.a, colour passed through.
+	if(fadeAlpha != 255){
+		GXColor kf = { 255, 255, 255, fadeAlpha };
+		GX_SetTevKColor(GX_KCOLOR3, kf);
+		GX_SetTevKAlphaSel(stage, GX_TEV_KASEL_K3_A);
+		GX_SetTevOrder(stage, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+		GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+		GX_SetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_APREV, GX_CA_KONST, GX_CA_ZERO);
 		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
 		    GX_TRUE, GX_TEVPREV);
 		GX_SetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1,
@@ -1747,15 +1765,17 @@ gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
 {
 	if(prelit == nil || numDir != 0)
 		return 0;
-	if(matcol.alpha != 255)
-		return 0;
+	// Material alpha is not baked in: a fading model (LOD -> HD, 16 frames)
+	// changes it every frame, which refused the cache and sent the whole
+	// building down the immediate path — 'fadein' at 8 ms median, 40 ms max
+	// in b199. The TEV multiplies it in (setup3DDraw fadeAlpha).
 	int32 n = geo->numVertices;
 	if(n <= 0)
 		return 0;
 
 	uint32 ambient = (uint32)ambR8 | ((uint32)ambG8<<8) | ((uint32)ambB8<<16);
 	uint32 key = (uint32)matcol.red | ((uint32)matcol.green<<8) |
-	    ((uint32)matcol.blue<<16) | ((uint32)matcol.alpha<<24);
+	    ((uint32)matcol.blue<<16);
 	if(g->colors && g->colorCount == n && g->colorKey == key && g->colorAmbient == ambient){
 		g->colorFrame = ::gxFrameNo;
 		return 1;
@@ -1781,7 +1801,7 @@ gxBuildColorCache(Geometry *geo, GxGeoExt *g, RGBA *prelit, int32 numDir,
 		fresh[i].red   = (uint8)mul255(r8, matcol.red);
 		fresh[i].green = (uint8)mul255(g8, matcol.green);
 		fresh[i].blue  = (uint8)mul255(b8, matcol.blue);
-		fresh[i].alpha = (uint8)mul255(prelit[i].alpha, matcol.alpha);
+		fresh[i].alpha = prelit[i].alpha;
 	}
 	DCFlushRange(fresh, n*sizeof(RGBA));
 	if(fresh != g->colors){
@@ -2241,7 +2261,8 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		bool32 sendUV2 = gxEnvTex != nil && gxEnvUV2;
 		setup3DDraw(tex != nil, 0, 1, 0,
 		    makeRGBA(255, 255, 255, 255), 1.0f, nil, GX_LIGHTNULL,
-		    sendColor, useIdx, ambK, posFrac, uvFrac, packNrm != nil);
+		    sendColor, useIdx, ambK, posFrac, uvFrac, packNrm != nil,
+		    (useIdx || cachedCol) ? matcol.alpha : 255);
 		if(useIdx){
 			GX_SetArray(GX_VA_POS, (void*)packPos, 3*sizeof(int16));
 			GX_SetArray(GX_VA_CLR0, gpk->colors, sizeof(RGBA));
