@@ -81,7 +81,7 @@ namespace gx {
 // the cache costs 2MB out of a 15MB arena — which is what pushed streaming
 // back into mustmalloc/exit(1). Raise this only on hardware, where freeing
 // the CPU actually matters and memory has been re-budgeted for it.
-#define GX_FORCE_PROGRESSIVE 1 // 480p even when the cable check says no; see startGX
+#define GX_FORCE_PROGRESSIVE 0 // 1 = 480p even without a component cable (no picture over composite); see startGX
 #define GX_DL_BUDGET 0
 // ON, with the measurement that flipped it: the same night alley read
 // 29fps/work29/oth18.7 direct and 59fps/work11/oth1.8 indexed — the "oth"
@@ -251,18 +251,12 @@ startGX(void)
 	// lines per field, so half the image on screen is always one field stale.
 	// PAL50 is left alone — 576p is a different resolution, not a flag.
 	//
-	// GX_FORCE_PROGRESSIVE exists because VIDEO_HaveComponentCable() alone is
-	// not a usable gate here. Measured: Dolphin reports cbl=0 regardless of its
-	// progressive-scan setting (the SYSCONF byte is rewritten back to 0 on
-	// launch, and the ProgressiveScan override is a per-game INI key that a
-	// loose .dol has no game ID to match), so on the emulator the cable check
-	// can never pass and the port can never be seen in 480p.
-	//
-	// Forcing is safe there — an emulator has no composite cable to be
-	// incompatible with — and on real hardware component cables and the GCVideo
-	// / GCHD digital adapters all set the DTV bit, so the forced path matches
-	// what the check would have allowed anyway. Set this to 0 for a console
-	// wired over composite, where progressive output is no picture at all.
+	// The cable decides (issue #10): 480p over component and the GCVideo /
+	// GCHD digital adapters, which set the DTV bit; interlaced otherwise, as
+	// progressive is no picture at all over composite or on a DOL-101.
+	// GX_FORCE_PROGRESSIVE = 1 skips the check: a loose .dol in Dolphin read
+	// cbl=0 whatever its progressive-scan setting said (SYSCONF byte rewritten
+	// on launch, no game ID for the per-game key).
 	if(GX_FORCE_PROGRESSIVE || VIDEO_HaveComponentCable())
 		switch(rmode->viTVMode >> 2){
 		case VI_NTSC:    rmode = &TVNtsc480Prog; break;
