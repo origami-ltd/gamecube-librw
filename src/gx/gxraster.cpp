@@ -658,7 +658,6 @@ destroyGeoExt(void *object, int32 offset, int32)
 	rwFree(g->packBase);
 	if(g->colors) ::gxColorBytes -= g->colorCount*sizeof(RGBA);
 	rwFree(g->colors);
-	free(g->uvDensity);
 	memset(g, 0, sizeof(*g));
 	return object;
 }

@@ -598,70 +598,6 @@ targetsTexture(Camera *cam)
 static void gxOscFrameTick(void);   // osc probe, defined further down
 static void gxColorRetireSweep(void);   // colour-cache retire ring, defined further down
 
-static float gxLodFocal;   // 0 = no level selection (orthographic)
-static V3d gxLodEye;
-extern int32 gxWantLevel;  // gxraster.cpp: the level the next bind should page in
-
-// See GxGeoExt::uvDensity. Edges under a centimetre are seams, not surface.
-static float*
-gxMeshUVDensity(Geometry *geo, GxGeoExt *gpk)
-{
-	if(gpk->uvDensity || gpk->uvDensityTried)
-		return gpk->uvDensity;
-	gpk->uvDensityTried = 1;
-	if(!(gpk->packed & GXPACK_POS) || !(gpk->packed & GXPACK_UV) || geo->meshHeader == nil)
-		return nil;
-	int32 nm = geo->meshHeader->numMeshes;
-	float *d = (float*)malloc(sizeof(float)*2*nm);
-	if(d == nil)
-		return nil;
-	float ps = 1.0f/(float)(1 << gpk->posShift), ts = 1.0f/(float)(1 << gpk->uvShift);
-	Mesh *mesh = geo->meshHeader->getMeshes();
-	for(int32 m = 0; m < nm; m++, mesh++){
-		float du2 = 0.0f, dv2 = 0.0f;
-		// consecutive index pairs at distance 1 and 2: every edge of a strip,
-		// and of a list plus a few cross-triangle pairs (which only make the
-		// estimate finer, never coarser)
-		for(uint32 k = 0; k + 1 < mesh->numIndices; k++)
-			for(uint32 j = 1; j <= 2 && k + j < mesh->numIndices; j++){
-				int32 a = mesh->indices[k], b = mesh->indices[k+j];
-				const int16 *pa = gpk->pos + 3*a, *pb = gpk->pos + 3*b;
-				float dx = (pa[0]-pb[0])*ps, dy = (pa[1]-pb[1])*ps, dz = (pa[2]-pb[2])*ps;
-				float l2 = dx*dx + dy*dy + dz*dz;
-				if(l2 < 1e-4f)
-					continue;
-				const int16 *ta = gpk->uv + 2*a, *tb = gpk->uv + 2*b;
-				float du = (ta[0]-tb[0])*ts, dv = (ta[1]-tb[1])*ts;
-				if(du*du > du2*l2) du2 = du*du/l2;
-				if(dv*dv > dv2*l2) dv2 = dv*dv/l2;
-			}
-		d[2*m] = du2;
-		d[2*m+1] = dv2;
-	}
-	gpk->uvDensity = d;
-	return d;
-}
-
-// The finest mip level the GP can use on this mesh this frame: texels per
-// pixel at the atomic's nearest point, facing the camera, is a lower bound on
-// the LOD the GP computes, so everything finer would never be sampled.
-// `distScale` is the nearest distance over the atomic's world scale.
-static int32
-gxMeshLevel(const float *dens, int32 m, Raster *r, float distScale)
-{
-	if(dens == nil || r == nil || distScale <= 0.0f)
-		return 0;
-	float t2 = dens[2*m]*r->width*r->width;
-	float v2 = dens[2*m+1]*r->height*r->height;
-	if(v2 > t2) t2 = v2;
-	float tpp = sqrtf(t2)*distScale;
-	if(!(tpp >= 2.0f))
-		return 0;
-	int e;
-	frexpf(tpp, &e);
-	return e - 1;   // floor(log2(tpp))
-}
-
 static void
 beginUpdate(Camera *cam)
 {
@@ -720,10 +656,6 @@ beginUpdate(Camera *cam)
 	}
 	GX_LoadProjectionMtx(gxProj, gxProjType);
 	gxHaveCamera = TRUE;
-	// For the per-mesh mip level: pixels per unit at distance 1, and the eye.
-	gxLodFocal = cam->projection == Camera::PERSPECTIVE && cam->viewWindow.y > 0.0f ?
-	    rmode->efbHeight*0.5f/cam->viewWindow.y : 0.0f;
-	gxLodEye = cam->getFrame()->getLTM()->pos;
 }
 
 static void
@@ -2098,21 +2030,6 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 	// one per mesh (~350 meshes/frame were paying for it).
 	loadWorldMtx(world, lit2);
 
-	// Mip level inputs, once per atomic (gxMeshLevel): nearest distance over
-	// the world scale and the focal length, and the per-mesh UV density.
-	float lodDistScale = 0.0f;
-	const float *lodDens = nil;
-	if(gxLodFocal > 0.0f && packUV){
-		Sphere *sph = atomic->getWorldBoundingSphere();
-		V3d dv = sub(sph->center, gxLodEye);
-		float dist = sqrtf(dot(dv, dv)) - sph->radius;
-		float scale = sqrtf(dot(world->right, world->right));
-		if(dist > 0.5f && scale > 0.0f){
-			lodDens = gxMeshUVDensity(geo, gpk);
-			lodDistScale = dist/(scale*gxLodFocal);
-		}
-	}
-
 	Mesh *mesh = geo->meshHeader->getMeshes();
 	for(uint16 m = 0; m < geo->meshHeader->numMeshes; m++, mesh++){
 		if(mesh->numIndices == 0)
@@ -2132,12 +2049,8 @@ atomicRenderCB(ObjPipeline *pipe, Atomic *atomic)
 		// gxPackGeometry they may live in the packed int16 array instead of
 		// the float one. Testing only `uv` here drew every packed world
 		// geometry untextured — a white city with correct silhouettes.
-		GXTexObj *tex = nil;
-		if(texture && (uv || packUV)){
-			gxWantLevel = gxMeshLevel(lodDens, m, texture->raster, lodDistScale);
-			tex = gxGetTexture(texture->raster);
-			gxWantLevel = 0;
-		}
+		GXTexObj *tex = (texture && (uv || packUV)) ?
+		    gxGetTexture(texture->raster) : nil;
 		// NO skip on a failed tiling alloc, deliberately: hiding the mesh
 		// showed the void — whole buildings blinking BLACK while the
 		// retry/evict cycle churned, which is worse than the dark
