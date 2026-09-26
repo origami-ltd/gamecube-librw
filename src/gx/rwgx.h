@@ -97,6 +97,11 @@ struct GxGeoExt
 	uint32 colorKey;          // ambient and material this was built for
 	uint32 colorAmbient;
 	int32  colorCount;
+	// Per mesh, the largest (du/dp)^2 and (dv/dp)^2 over its edges in model
+	// space: with the texture size and the distance, the finest mip level the
+	// GP can sample on it (gx.cpp gxMeshLevel). Built on the first draw.
+	float *uvDensity;
+	uint8  uvDensityTried;
 };
 enum { GXPACK_POS = 1, GXPACK_UV = 2, GXPACK_TRIED = 4, GXPACK_NRM = 8 };
 // Quantise a streamed geometry in place. Call once, after the DFF has loaded

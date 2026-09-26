@@ -88,6 +88,8 @@ unsigned gxColorBytes;   // colour-cache arrays resident (gx.cpp)
 extern "C" { volatile unsigned gxDmaBusy; }   // MemoryWatcher: 1 while the main thread spins on an ARAM DMA
 unsigned gxSpills, gxWsFrameBytes, gxWsFramePeak;
 unsigned gxWsForced;   // B111: page-ins that had to GX_DrawDone and evict this frame's textures
+unsigned gxPageLevels[4];   // page-ins by first level: 0, 1, 2, 3+
+unsigned gxWsRetired;       // blocks swapped for a finer level mid-use
 extern "C" void *__real_memalign(size_t, size_t);
 unsigned gxFrameNo;
 // Set by CTxdStore around a dictionary read: its texels stay in MEM1 instead
@@ -126,6 +128,9 @@ struct GxRaster
 	bool32 spill;      // wsAddr is a heap block (window was full), freed two frames on
 	uint8 tlutSlot;      // B90: CI8 palette slot (GX_TLUT0+n)
 	uint8 tlutDirty;
+	uint8 levels;        // mip levels in the texels (txdconv); 0 or 1 = none
+	uint8 wsLevel;       // first level the window block holds
+	uint32 wsSize;       // bytes of that block: levels wsLevel..levels-1
 };
 
 int32 nativeRasterOffset;
@@ -151,6 +156,19 @@ bool32 gxTexCacheDirty;
 // ARAM side sees churn only through the streamer (a few textures a second);
 // the MEM1 window churns per camera turn, and a full scan of ~2000 spans per
 // page-in is well under the DMA it precedes.
+static inline uint32 gxNativeSize(uint8 fmt, int32 tw, int32 th);
+// Bytes of levels [0, level) of a mip chain: the offset of `level`.
+static uint32
+gxLevelOffset(uint8 fmt, int32 tw, int32 th, int32 level)
+{
+	uint32 off = 0;
+	for(int32 i = 0; i < level; i++)
+		off += gxNativeSize(fmt, tw >> i, th >> i);
+	return off;
+}
+// Level the draw about to bind wants (gx.cpp sets it per mesh, 0 = finest).
+int32 gxWantLevel;
+
 #ifdef RW_GAMECUBE
 #define GX_ARAM_TIER 1
 #else
@@ -302,10 +320,11 @@ gxWsDrop(Raster *raster)
 			if(gxWsList[i] != raster && GETGXRASTEREXT(gxWsList[i])->wsAddr == ext->wsAddr) shared = 1;
 		if(!shared){
 			gxWs.release(ext->wsAddr);
-			::gxWsBytes -= ext->tiledSize;
+			::gxWsBytes -= ext->wsSize;
 		}
 	}
 	ext->wsAddr = 0;
+	ext->wsSize = 0;
 	for(int32 i = 0; i < gxWsCount; i++)
 		if(gxWsList[i] == raster){
 			gxWsList[i] = gxWsList[--gxWsCount];
@@ -338,21 +357,28 @@ gxWsVictim(bool32 force)
 static Raster *gxTlutOwner[16];
 static uint32 gxTlutNext;
 static void
-gxInitWindowTexObj(Raster *raster, GxRaster *ext, uint32 blk)
+gxInitWindowTexObj(Raster *raster, GxRaster *ext, uint32 blk, int32 level)
 {
+	int32 w = raster->width >> level, h = raster->height >> level;
+	int32 below = ext->levels > level + 1 ? ext->levels - 1 - level : 0;
 	if(ext->gxFmt == GX_TF_CI8){
 		if(ext->tlutSlot == 0xFF || gxTlutOwner[ext->tlutSlot] != raster){
 			ext->tlutSlot = (uint8)(gxTlutNext++ & 15);
 			gxTlutOwner[ext->tlutSlot] = raster;
 		}
-		GX_InitTexObjCI(&ext->obj, (void*)blk, raster->width, raster->height,
+		GX_InitTexObjCI(&ext->obj, (void*)blk, w, h,
 		    GX_TF_CI8, GX_CLAMP, GX_CLAMP, GX_FALSE, GX_TLUT0 + ext->tlutSlot);
 		ext->tlutDirty = 1;
 	}else
-		GX_InitTexObj(&ext->obj, (void*)blk, raster->width, raster->height,
-		    ext->gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
-	    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+		GX_InitTexObj(&ext->obj, (void*)blk, w, h,
+		    ext->gxFmt, GX_CLAMP, GX_CLAMP, below ? GX_TRUE : GX_FALSE);
+	if(below)   // the PC's filter on 99% of its textures: LINEARMIPLINEAR
+		GX_InitTexObjLOD(&ext->obj, GX_LIN_MIP_LIN, GX_LINEAR, 0.0f, (f32)below, 0.0f,
+		    GX_FALSE, GX_FALSE, GX_ANISO_1);
+	else
+		GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
+		    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+	ext->wsLevel = (uint8)level;
 }
 // Called at every bind of a CI8 raster: load its palette into its slot unless
 // the slot still holds it.
@@ -374,20 +400,67 @@ gxBindTlut(Raster *raster, GxRaster *ext)
 	}
 }
 
-// Bring an ARAM-resident texture into the MEM1 window for drawing.
+// A window block a draw has outgrown (it wants a finer level than the block
+// holds) cannot be reused yet: draws already in the FIFO may still sample it.
+// Parked here and released once the GP is two frames past it, like a spill.
+enum { GX_ZOMBIE_N = 64 };
+static struct { uint32 addr, size, frame; bool32 spill; } gxZombie[GX_ZOMBIE_N];
+static int32 gxZombieN;
+static void
+gxZombieRelease(int32 i)
+{
+	if(gxZombie[i].spill){
+		void *p = (void*)gxZombie[i].addr;
+		if(gcBigContains(p)) gcBigFree(p); else free(p);
+	}else{
+		gxWs.release(gxZombie[i].addr);
+		::gxWsBytes -= gxZombie[i].size;
+	}
+	gxZombie[i] = gxZombie[--gxZombieN];
+}
+static void
+gxWsRetire(Raster *raster)
+{
+	GxRaster *ext = GETGXRASTEREXT(raster);
+	bool32 shared = 0;   // a twin still drawing from the block keeps it
+	for(int32 i = 0; i < gxWsCount && !shared; i++)
+		if(gxWsList[i] != raster && GETGXRASTEREXT(gxWsList[i])->wsAddr == ext->wsAddr) shared = 1;
+	if(!shared){
+		if(gxZombieN == GX_ZOMBIE_N){   // full: let the GP finish, then all may go
+			GX_DrawDone();
+			while(gxZombieN) gxZombieRelease(0);
+		}
+		gxZombie[gxZombieN].addr = ext->wsAddr; gxZombie[gxZombieN].size = ext->wsSize;
+		gxZombie[gxZombieN].frame = ::gxFrameNo; gxZombie[gxZombieN].spill = ext->spill;
+		gxZombieN++;
+	}
+	ext->wsAddr = 0; ext->wsSize = 0; ext->spill = 0;
+	for(int32 i = 0; i < gxWsCount; i++)
+		if(gxWsList[i] == raster){
+			gxWsList[i] = gxWsList[--gxWsCount];
+			break;
+		}
+	::gxWsRetired++;
+}
+
+// Bring an ARAM-resident texture into the MEM1 window for drawing, from mip
+// `level` down: the finer levels stay in ARAM until a draw asks for them.
 extern "C" { extern volatile const char *gMainWhere; }
 static bool
-gxPageIn(Raster *raster, GxRaster *ext)
+gxPageIn(Raster *raster, GxRaster *ext, int32 level)
 {
 	gMainWhere = "page-in";
-	uint32 size = ext->tiledSize;
+	uint32 off = gxLevelOffset(ext->gxFmt, raster->width, raster->height, level);
+	uint32 size = ext->tiledSize - off;
 	// B84: a twin raster (same ARAM span, B74 dedupe) already in the window
-	// means no DMA and no new block: point at its texels.
+	// at this level or finer means no DMA and no new block: point at its texels.
 	for(int32 i = 0; i < gxWsCount && gxWsCount < gxWsCap; i++){
 		GxRaster *o = GETGXRASTEREXT(gxWsList[i]);
-		if(o->aram == ext->aram && o->wsAddr && !o->spill && o->tiledSize == size){
-			gxInitWindowTexObj(raster, ext, o->wsAddr);
+		if(o->aram == ext->aram && o->wsAddr && !o->spill && o->tiledSize == ext->tiledSize &&
+		   o->wsLevel <= level){
+			gxInitWindowTexObj(raster, ext, o->wsAddr, o->wsLevel);
 			ext->wsAddr = o->wsAddr;
+			ext->wsSize = o->wsSize;
 			ext->spill = 0;
 			gxWsList[gxWsCount++] = raster;
 			::gxWsShared++;
@@ -408,6 +481,7 @@ gxPageIn(Raster *raster, GxRaster *ext)
 			GX_DrawDone();
 			forced = 1;
 			::gxWsForced++;
+			while(gxZombieN) gxZombieRelease(0);   // the GP is idle: nothing reads them now
 			continue;
 		}
 		if(victim == nil || gxWsCount >= gxWsCap){
@@ -432,8 +506,10 @@ gxPageIn(Raster *raster, GxRaster *ext)
 	// Any cache line of the previous occupant must go before the DMA lands,
 	// or a later write-back would put stale bytes over the new texels.
 	DCInvalidateRange((void*)blk, size);
-	gxAramTransfer(ARQ_ARAMTOMRAM, (void*)blk, ext->aram, size);
-	gxInitWindowTexObj(raster, ext, blk);
+	gxAramTransfer(ARQ_ARAMTOMRAM, (void*)blk, ext->aram + off, size);
+	gxInitWindowTexObj(raster, ext, blk, level);
+	ext->wsSize = size;
+	::gxPageLevels[level < 3 ? level : 3]++;
 	// The block may have held another texture two frames ago and TMEM may
 	// still cache it by address: invalidate now, mid-frame, not at the next
 	// beginUpdate.
@@ -459,7 +535,7 @@ gxTierFrameEnd(void)
 	uint32 bytes = 0;
 	for(int32 i = 0; i < gxWsCount; i++){
 		GxRaster *e = GETGXRASTEREXT(gxWsList[i]);
-		if(e->lastFrame == done) bytes += e->tiledSize;
+		if(e->lastFrame == done) bytes += e->wsSize;
 	}
 	::gxWsFrameBytes = bytes;
 	if(bytes > ::gxWsFramePeak) ::gxWsFramePeak = bytes;
@@ -467,6 +543,12 @@ gxTierFrameEnd(void)
 		GxRaster *e = GETGXRASTEREXT(gxWsList[i]);
 		if(e->spill && e->lastFrame + 2 <= ::gxFrameNo)
 			gxWsDrop(gxWsList[i]);   // swaps the tail in; re-check this slot
+		else
+			i++;
+	}
+	for(int32 i = 0; i < gxZombieN; ){
+		if(gxZombie[i].frame + 2 <= ::gxFrameNo)
+			gxZombieRelease(i);      // swaps the tail in; re-check this slot
 		else
 			i++;
 	}
@@ -538,7 +620,8 @@ gxAramRelease(Raster *raster, GxRaster *ext)
 }
 #else
 static inline bool gxAramStore(GxRaster*, uint32) { return false; }
-static inline bool gxPageIn(Raster*, GxRaster*) { return false; }
+static inline bool gxPageIn(Raster*, GxRaster*, int32) { return false; }
+static inline void gxWsRetire(Raster*) {}
 static inline void gxAramRelease(Raster*, GxRaster*) {}
 static inline void gxBindTlut(Raster*, GxRaster*) {}
 void gxTierFrameEnd(void) {}
@@ -573,6 +656,7 @@ destroyGeoExt(void *object, int32 offset, int32)
 	rwFree(g->packBase);
 	if(g->colors) ::gxColorBytes -= g->colorCount*sizeof(RGBA);
 	rwFree(g->colors);
+	free(g->uvDensity);
 	memset(g, 0, sizeof(*g));
 	return object;
 }
@@ -1275,7 +1359,10 @@ gxGetTexture(Raster *raster)
 
 	GxRaster *ext = GETGXRASTEREXT(raster);
 	if(ext->aram){
-		if(ext->wsAddr == 0 && !gxPageIn(raster, ext))
+		int32 want = ext->levels > 1 ? (gxWantLevel < ext->levels ? gxWantLevel : ext->levels - 1) : 0;
+		if(ext->wsAddr && ext->wsLevel > want)
+			gxWsRetire(raster);  // the block holds only coarser levels than this draw needs
+		if(ext->wsAddr == 0 && !gxPageIn(raster, ext, want))
 			return nil;          // window full of this frame's textures: untextured once
 		ext->lastFrame = ::gxFrameNo;
 		gxBindTlut(raster, ext);
@@ -1633,10 +1720,15 @@ gxFinishNativeRaster(Raster *raster, int32 tw, int32 th, uint32 size)
 {
 	GxRaster *ext = GETGXRASTEREXT(raster);
 	DCFlushRange(ext->tiled, size);
+	bool32 mip = ext->levels > 1;
 	GX_InitTexObj(&ext->obj, ext->tiled, tw, th, ext->gxFmt,
-	    GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
-	    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
+	    GX_CLAMP, GX_CLAMP, mip ? GX_TRUE : GX_FALSE);
+	if(mip)
+		GX_InitTexObjLOD(&ext->obj, GX_LIN_MIP_LIN, GX_LINEAR, 0.0f, (f32)(ext->levels - 1), 0.0f,
+		    GX_FALSE, GX_FALSE, GX_ANISO_1);
+	else
+		GX_InitTexObjLOD(&ext->obj, GX_LINEAR, GX_LINEAR, 0, 0, 0,
+		    GX_DISABLE, GX_DISABLE, GX_ANISO_1);
 	ext->hasTex = 1;
 	ext->dirty = 0;
 	gxTexCacheDirty = 1;
@@ -1698,6 +1790,13 @@ readNativeTexture(Stream *stream)
 		gxNativeFail("dims", tw, th);
 		return nil;
 	}
+	// Mip chains (txdconv): CMPR, power of two, every level at least a tile.
+	int32 levels = header[85] ? header[85] : 1;
+	if(levels > 1 && (gxFmt != GXFMT_CMPR || (tw & (tw-1)) || (th & (th-1)) ||
+	   (tw >> (levels-1)) < 8 || (th >> (levels-1)) < 8)){
+		gxNativeFail("levels", levels, gxFmt);
+		return nil;
+	}
 
 	Texture *tex = Texture::create(nil);
 	if(tex == nil)
@@ -1707,7 +1806,7 @@ readNativeTexture(Stream *stream)
 	strncpy(tex->mask, (char*)&header[40], 32);
 
 	uint32 size = stream->readU32();
-	uint32 expect = gxNativeSize(gxFmt, tw, th);
+	uint32 expect = gxLevelOffset(gxFmt, tw, th, levels);
 	if(size != expect){
 		gxNativeFail("size", size, expect);
 		tex->destroy();
@@ -1724,6 +1823,7 @@ readNativeTexture(Stream *stream)
 	GxRaster *ext = GETGXRASTEREXT(raster);
 	ext->tiledSize = size;
 	ext->gxFmt = gxFmt;
+	ext->levels = (uint8)levels;
 #if GX_ARAM_TIER
 	if(filterAddressing & 0x80000000u){
 		// B89: shared-pool reference (tools/gamecube/sharedpool.py): no texels
@@ -1812,7 +1912,8 @@ writeNativeTexture(Texture *tex, Stream *stream)
 	Raster *raster = tex->raster;
 	GxRaster *ext = GETGXRASTEREXT(raster);
 	int32 tw = raster->width, th = raster->height;
-	uint32 size = gxNativeSize(ext->gxFmt, tw, th);
+	int32 levels = ext->levels > 1 ? ext->levels : 1;
+	uint32 size = gxLevelOffset(ext->gxFmt, tw, th, levels);
 
 	writeChunkHeader(stream, ID_STRUCT, GXNATIVE_HEADER + 4 + size);
 	uint8 header[GXNATIVE_HEADER];
@@ -1826,7 +1927,7 @@ writeNativeTexture(Texture *tex, Stream *stream)
 	writeLE16(&header[80], tw);
 	writeLE16(&header[82], th);
 	header[84] = 16;                 // depth of the tiled copy
-	header[85] = 1;                  // one level; mips are a later concern
+	header[85] = (uint8)levels;
 	header[86] = Raster::TEXTURE;
 	header[87] = ext->gxFmt;
 	stream->write8(header, sizeof(header));
@@ -1839,7 +1940,7 @@ getSizeNativeTexture(Texture *tex)
 {
 	Raster *raster = tex->raster;
 	GxRaster *ext = GETGXRASTEREXT(raster);
-	uint32 size = gxNativeSize(ext->gxFmt, raster->width, raster->height);
+	uint32 size = gxLevelOffset(ext->gxFmt, raster->width, raster->height, ext->levels > 1 ? ext->levels : 1);
 	return 12 + GXNATIVE_HEADER + 4 + size;
 }
 
