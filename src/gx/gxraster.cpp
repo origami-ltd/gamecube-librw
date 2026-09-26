@@ -183,7 +183,7 @@ int32 gxWantLevel;
 #include <ogc/cache.h>
 
 enum {
-	GX_WS_BYTES     = 3072*1024,   // B85: 3.5MB -> 3MB; twins now share window blocks (B84)   // MEM1 window: what one frame can draw. 3MB starved the
+	GX_WS_BYTES     = 2304*1024,   // 09-26: 3MB -> 2.25MB. With 256+ textures halved (txdconv --adaptive) b195's frame set peaked at 1667K, and the 768K goes to the heap, where HD models waited at the floor. B85: 3.5MB -> 3MB; twins now share window blocks (B84)   // MEM1 window: what one frame can draw. 3MB starved the
 	                               // cutscene characters (per-frame set 3.2MB+, spills need heap
 	                               // the audio had taken) — B40 back to 3.5MB; audio pays instead.
 	GX_ARAM_RESERVE = 4804*1024,   // audio: ADPCM bank 3835K + seven ped-comment slots 137K (ADPCM-sized, was 553K) + three 256K stream rings (B68) = 4740K; 64K margin as before
